@@ -1,0 +1,783 @@
+---
+title: "FF_STK_overlap_analysis"
+author: "Vladimir"
+date: "2023-12-14"
+output: html_document
+---
+# FIRST: To import environment
+```{r}
+load("C:/Master thesis data/FF_STK_overlap_analysis_data.RData")
+```
+
+```{r}
+# Initialize a list of required packages
+required_packages <- c("move2", "dplyr", "lubridate", "readr", "readxl", "sf", "spatialrisk",)
+
+# Install any missing packages
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load the required libraries
+library(move2)
+library(dplyr)
+library(lubridate)
+library(sf)
+library(spatialrisk)
+
+# Check for 'rlang' package version and install/update if necessary
+if(!("rlang" %in% installed.packages()[,"Package"]) || packageVersion("rlang") < "1.1.2") {
+  install.packages("rlang")
+}
+
+#check version: needs to be >= 1.1.2 to use 'move2'
+packageVersion("rlang")
+```
+
+##Forest Fire Data Preparation
+```{r}
+# Read the forest fire data and prepare for spatial analysis
+ff_data <- read.csv('viirs-snpp_2014_Uzbekistan.csv', colClasses = c("acq_time"="character")) %>%
+ 
+   # Convert the acquisition date and time into a POSIXct object to represent date-time, ensuring uniform time zone (UTC) for accurate temporal analysis
+  mutate(acq_datetime = as.POSIXct(paste(acq_date, acq_time), format="%Y-%m-%d %H%M", tz='UTC')) %>%
+ 
+   # Convert the forest fire data to an 'sf' object for spatial operations, setting CRS (Coordinate Reference System) to WGS 84 (World Geodetic System 1984) (EPSG:4326)
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, agr = "constant", remove = FALSE)
+
+```
+
+##Stork Tracking Data Preparation
+```{r}
+# Read the stork tracking data and prepare for spatial analysis
+stk_data <- read.csv('LifeTrack White Stork Uzbekistan.csv') %>%
+  
+  # Transform the timestamp into a POSIXct object for consistent date-time representation, with UTC as the standardized time zone for comparison
+  mutate(timestamp = as.POSIXct(timestamp, format="%Y-%m-%d %H:%M:%S", tz='UTC')) %>%
+ 
+  # Remove rows where location.long or location.lat is NA
+  filter(!is.na(location.long) & !is.na(location.lat)) %>%
+  
+  # Convert the stork tracking data to an 'sf' object to enable spatial analysis, using WGS 84 (EPSG:4326) coordinate reference system
+  st_as_sf(coords = c("location.long", "location.lat"), crs = 4326, agr = "constant", remove = FALSE)
+
+
+```
+
+##Pre-Clean Data
+```{r}
+# Check for empty coordinates and remove them
+Empty_coords <- st_is_empty(stk_data)
+if (sum(Empty_coords) > 0) {
+  stk_data <- stk_data[!Empty_coords,]
+}
+
+```
+
+#2.Spatial analysis
+##Prepare Spatial Coordinates and Time Data
+```{r}
+# Extract coordinates and time for both datasets, ensuring time remains in POSIXct format
+ff_coords_time <- st_coordinates(ff_data) %>% 
+                  as.data.frame() %>% 
+                  mutate(time=ff_data$acq_datetime) %>%
+                  rename(lat=2, lon=1, time=3)
+                  
+stk_coords_time <- st_coordinates(stk_data) %>% 
+                    as.data.frame() %>% 
+                    mutate(time=stk_data$timestamp) %>%
+                    rename(lat=2, lon=1, time=3)
+
+```
+
+
+##Define Spatial-Temporal Matching Function for a timeframe of 12h before and after fire event
+```{r}
+get_extended_overlap_neighbors <- function(x, stk_coords_time, ff_coords_time, radius, daysdiff) {
+  Index <- seq_len(nrow(ff_coords_time))
+  
+  
+  # Calculate time difference in seconds
+  time_diff_sec <- as.numeric(difftime(ff_coords_time[,3], stk_coords_time[x,3], units = "secs"))
+  
+  # Updated Temporal proximity check for -0.5 days before to 0.5 days after 
+  #Temporal <- (time_diff_sec >= -0.5 * 86400) & (time_diff_sec <= 0.5 * 86400) ### THIS might be wrong and we should be using:
+  Temporal <- (time_diff_sec >= -daysdiff * 86400) & (time_diff_sec <= daysdiff * 86400)
+
+  # Spatial proximity check using Haversine formula
+  Spatial <- spatialrisk:::haversine_loop_cpp(ff_coords_time[,c(1,2)], lat_center=stk_coords_time[x,2], lon_center=stk_coords_time[x,1], radius=radius)
+  
+  if (nrow(Spatial) == 0 || length(Temporal) == 0) {
+    Res <- NA
+  } else {
+    Out <- Index[(Index %in% Spatial$id) & Temporal]
+    Res <- if (length(Out) == 0) {
+      NA
+    } else {
+      if (length(Out) == 1) {
+        Out
+      } else {
+        Spatial$id[Spatial$id %in% Out][which.min(Spatial$distance_m[Spatial$id %in% Out])]
+      }
+    }
+  }
+  return(Res)
+}
+
+
+```
+
+## Find spatial and temporal neighbors within 25km and 12h before and after an overlap between ff and stk
+```{r}
+
+# Find spatial and temporal neighbors within 50 meter and 12h before an overlap between ff and stk (25000, -05)
+neighbors_25km <- sapply(seq_len(nrow(stk_coords_time)), FUN=function(x) get_extended_overlap_neighbors(x, stk_coords_time, ff_coords_time, 25000, -0.5))
+
+```
+
+## Extract neighbor data for the extended analysis
+```{r}
+neighbors_25km_data <- stk_data[!is.na(neighbors_25km),]
+
+# Correct the line for calculating distance to nearest fire using the extended neighbors data
+neighbors_25km_data$Dist2Fire <- st_distance(stk_data[!is.na(neighbors_25km),], ff_data[neighbors_25km[!is.na(neighbors_25km)],], by_element = TRUE)
+
+
+```
+
+## Analyse neigbor data
+```{r}
+  # Ensure ff_data has an identifiable, non-spatial ID column (if not already present)
+ff_data <- ff_data %>% 
+  mutate(fire_id = row_number()) 
+
+# Prepare fire data for joining by dropping geometry and selecting necessary columns
+ff_data_for_join <- ff_data %>% 
+  st_drop_geometry() %>%
+  select(fire_id, fire_longitude = longitude, fire_latitude = latitude, fire_time = acq_datetime, fire_confidence = confidence)
+
+# Create the final dataset with all required information, including fire details and time difference for the extended analysis
+Final_tracks_extended <- neighbors_25km_data %>%
+  # Add nearest fire ID from the non-NA values in 'neighbors_25km'
+  mutate(Nearest_fire_ID = neighbors_25km[!is.na(neighbors_25km)]) %>%
+  # Join with fire data to get details of the nearest fire
+  left_join(ff_data_for_join, by = c("Nearest_fire_ID" = "fire_id")) %>%
+  # Calculate time difference between stork timestamp and fire acquisition time
+  mutate(TimeDiff2Fire = difftime(timestamp, ff_data_for_join$fire_time[Nearest_fire_ID]))
+
+
+# Save the final tracks data to a file for the extended analysis
+write.csv(Final_tracks_extended, 'Final_Tracks_Stork_Fire_Overlap_Extended.csv', row.names = FALSE)
+
+```
+
+
+
+```{r}
+read.csv('Final_Tracks_Stork_Fire_Overlap_Extended.csv')
+
+```
+
+##plotting all the overlaps at once from all birds with no temporal discinction
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# Assuming Final_tracks_extended already includes stork locations and fire locations
+
+# Convert Final_tracks_extended to an sf object for plotting, specifying stork location columns
+# This step assumes your data includes longitude and latitude for both storks and fires
+# and that the CRS (Coordinate Reference System) is WGS 84 (EPSG:4326)
+Final_tracks_extended_sf <- Final_tracks_extended %>%
+  st_as_sf(coords = c("location.long", "location.lat"), crs = 4326, agr = "constant")
+
+# Similarly, prepare fire locations as an sf object if not already
+fires_sf <- Final_tracks_extended %>%
+  st_as_sf(coords = c("fire_longitude", "fire_latitude"), crs = 4326, agr = "constant")
+
+# Create the plot using ggplot2 and geom_sf for both stork movements and fire locations
+ggplot() +
+  geom_sf(data = Final_tracks_extended_sf, color = 'blue', size = 0.5, alpha = 0.7) + # Plot stork movements
+  geom_sf(data = fires_sf, color = 'red', size = 2, shape = 17) + # Plot fire locations
+  labs(title = 'Map of overlap', x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  theme(legend.position = "none") # Optionally remove the legend
+
+```
+
+
+##plot for each stork showing its track and the locations where overlaps with fire happened
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# Assuming Final_tracks_extended contains both stork locations and associated fire locations
+
+# Get a list of unique stork identifiers
+unique_storks <- unique(Final_tracks_extended$tag.local.identifier)
+
+# Loop through each stork identifier to generate and save plots
+for (stork_id in unique_storks) {
+  
+  # Filter the tracking data for the current stork
+  stork_track <- Final_tracks_extended %>%
+    filter(tag.local.identifier == stork_id) %>%
+    arrange(timestamp)
+  
+  # Filter for fire events associated with the current stork
+  stork_fire <- Final_tracks_extended %>%
+    filter(tag.local.identifier == stork_id)
+  
+  # Generate the plot for the current stork
+  p <- ggplot() +
+    geom_path(data = stork_track, aes(x = location.long, y = location.lat, group = tag.local.identifier), color = 'blue', linewidth = 0.1) + # Draw lines connecting the points in order
+    geom_point(data = stork_track, aes(x = location.long, y = location.lat), color = 'blue', size = 1.0) + # Plot the stork's positions
+    geom_point(data = stork_fire, aes(x = fire_longitude, y = fire_latitude), color = 'red', size = 2) + # Highlight the fire event location
+    labs(title = paste('Track of Stork with ID:', stork_id, 'with Forest Fire Location')) +
+    theme_minimal() # Use a minimal theme for the plot
+  
+  # Print the plot; alternatively, you could save each plot to a file
+  print(p)
+  
+  # Example of saving the plot to a file, uncomment the line below to use it
+  # ggsave(filename = paste0("Stork_Track_", stork_id, ".png"), plot = p, width = 10, height = 8)
+}
+
+```
+
+
+##plot for each stork showing its track and the locations where overlaps with fire happened with colorscale 2 (bird and fires)
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+library(scales) # For color scales
+
+# Assuming Final_tracks_extended is prepared as shown
+
+# Loop through each unique stork identifier to generate and save plots
+for (stork_id in unique(Final_tracks_extended$tag.local.identifier)) {
+  
+  # Filter the data for the current stork and arrange by timestamp
+  stork_data <- Final_tracks_extended %>%
+    filter(tag.local.identifier == stork_id) %>%
+    arrange(timestamp)
+  
+  # Create a numeric scale for time based on the timestamp for both stork and fire
+  # Calculate hours since the first observation
+  stork_data$hours_since_first <- as.numeric(difftime(stork_data$timestamp, min(stork_data$timestamp), units = "hours"))
+  
+  # Plot
+  p <- ggplot(data = stork_data) +
+    geom_path(aes(x = location.long, y = location.lat, group = tag.local.identifier, color = hours_since_first), 
+              linewidth = 1.5) + # Use thicker lines for visibility
+    scale_color_viridis_c(option = "C", direction = -1, begin = 0, end = 1, name = "Hour since\nfirst observation") + # Color scale for time
+    geom_point(aes(x = location.long, y = location.lat), color = 'blue', size = 1.0, alpha = 0.5) + # Stork positions
+    geom_point(data = stork_data, aes(x = fire_longitude, y = fire_latitude, color = hours_since_first), 
+               size = 2, shape = 17) + # Fire locations with time-based coloring
+    labs(title = paste('Track of Stork with ID:', stork_id, 'with Forest Fire Location'), color = "Hours since\nfirst observation") +
+    theme_minimal() + theme(legend.position = "right")
+  
+  print(p)
+  
+  # Example of saving the plot to a file
+  # ggsave(filename = paste0("Stork_Track_", stork_id, "_Temporal.png"), plot = p, width = 10, height = 8)
+}
+
+```
+
+
+# This code generates geographical plots illustrating the overlap between stork movements and forest fire locations over time. Each unique stork's path and associated fire events are visualized with color gradients indicating the time of day. It is possible to generate JPEG of the plots
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# Loop through each unique stork identifier to generate plots
+for (stork_id in unique(Final_tracks_extended$tag.local.identifier)) {
+  
+  # Filter data for the current stork
+  stork_data <- Final_tracks_extended %>%
+    filter(tag.local.identifier == stork_id)
+  
+  # Create the plot
+  p <- ggplot(data = stork_data) +
+    # Bird Tracks: Thin black lines connecting geographical points
+    geom_path(aes(x = location.long, y = location.lat), color = "black", size = 0.5) +
+    # Bird Locations: Points colored by normalized hour of day, color inverted
+    geom_point(aes(x = location.long, y = location.lat, color = hour_of_day), size = 2, alpha = 0.8) +
+    # Forest Fires: Triangles with the same color palette as bird points
+    geom_point(aes(x = fire_longitude, y = fire_latitude, color = fire_hour_of_day), shape = 17, size = 3) +
+    # Use scale_color_gradientn for a custom continuous scale
+    scale_color_gradientn(colors = c("white", "black"), guide = guide_colourbar(direction = "horizontal", title.position = "top", title.hjust = 0.5)) +
+    labs(title = paste("Stork ID:", stork_id, "- Daily Movement and Fire Events"), x = "Longitude", y = "Latitude") +
+    theme_minimal()
+  
+  print(p)
+  
+  # Optionally save each plot to a file
+  # ggsave(filename = paste0("Stork_Track_and_Fire_", stork_id, "_Inverted.png"), plot = p, width = 10, height = 8, dpi = 300)
+}
+
+
+```
+# This code generates geographical plots illustrating the overlap between stork movements and forest fire locations over time. Each unique stork's path and associated fire events are visualized with color gradients indicating the time of day. The plots are compiled and saved into a single PDF file, with each stork's data presented on a separate page.
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# Open a PDF device
+pdf("All_Stork_Tracks_and_Fires.pdf", width = 10, height = 8)
+
+# Loop through each unique stork identifier to generate plots
+for (stork_id in unique(Final_tracks_extended$tag.local.identifier)) {
+  
+  # Filter data for the current stork
+  stork_data <- Final_tracks_extended %>%
+    filter(tag.local.identifier == stork_id)
+  
+  # Create the plot
+  p <- ggplot(data = stork_data) +
+    geom_path(aes(x = location.long, y = location.lat), color = "black", size = 0.5) +
+    geom_point(aes(x = location.long, y = location.lat, color = hour_of_day), size = 2, alpha = 0.8) +
+    geom_point(aes(x = fire_longitude, y = fire_latitude, color = fire_hour_of_day), shape = 17, size = 3) +
+    scale_color_gradientn(colors = c("white", "black"), guide = guide_colourbar(direction = "horizontal", title.position = "top", title.hjust = 0.5)) +
+    labs(title = paste("Stork ID:", stork_id, "- Daily Movement and Fire Events"), x = "Longitude", y = "Latitude") +
+    theme_minimal()
+  
+  # Print the plot to add it to the PDF
+  print(p)
+}
+
+# Close the PDF device
+dev.off()
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# Prepare the data: normalize the time data for color mapping
+Final_tracks_extended <- Final_tracks_extended %>%
+  mutate(hour_of_day = as.numeric(format(timestamp, "%H")) + as.numeric(format(timestamp, "%M")) / 60,
+         hour_since_first = as.numeric(difftime(timestamp, min(timestamp, na.rm = TRUE), units = "hours")) / 24) # Assuming 'timestamp' is correctly formatted
+
+# Open a PDF device to save all plots
+pdf("Stork_Movements_and_Fire_Events.pdf", width = 10, height = 8)
+
+# Loop through each unique stork identifier to generate plots
+for (stork_id in unique(Final_tracks_extended$tag.local.identifier)) {
+  
+  # Filter data for the current stork
+  stork_data <- Final_tracks_extended %>%
+    filter(tag.local.identifier == stork_id)
+  
+  # Create the plot
+  p <- ggplot(data = stork_data) +
+    # Stork Tracks: Thin black lines for geographic paths
+    geom_path(aes(x = location.long, y = location.lat), color = "black", size = 1.0) +
+    # Stork Locations: Points colored by time since first observation using viridis
+    geom_point(aes(x = location.long, y = location.lat, color = hour_since_first), size = 2, alpha = 0.8) +
+    # Forest Fires: Triangles, colored with the same scale as stork locations
+    geom_point(aes(x = fire_longitude, y = fire_latitude, color = hour_since_first), shape = 17, size = 3) +
+    # Apply viridis color scale for time, making the legend horizontal
+    scale_color_viridis_c(name = "Hours since\nfirst observation", direction = -1, option = "C", guide = guide_colourbar(direction = "horizontal", title.position = "top", title.hjust = 0.5)) +
+    labs(title = paste("Stork ID:", stork_id, "- Movement and Fire Events with Time Coding")) +
+    theme_minimal() + theme(legend.position = "bottom")
+  
+  # Print the plot to the current PDF page
+  print(p)
+}
+
+# Close the PDF device
+dev.off()
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# Open a PDF device to save all plots
+pdf("Stork_Movements_and_Fire_Events_Corrected_Timing.pdf", width = 10, height = 8)
+
+# Loop through each unique stork identifier to generate plots
+for (stork_id in unique(Final_tracks_extended$tag.local.identifier)) {
+  
+  # Filter data for the current stork, focusing on entries within 12 hours of a fire event
+  stork_data <- Final_tracks_extended %>%
+    filter(tag.local.identifier == stork_id) %>%
+    mutate(time_diff_hours = as.numeric(difftime(timestamp, fire_time, units = "hours")),
+           # Identify entries within +/- 12 hours
+           within_window = time_diff_hours >= -12 & time_diff_hours <= 12) %>%
+    filter(within_window == TRUE)
+
+  # Create the plot
+  p <- ggplot(data = stork_data) +
+    # Stork Tracks: Thin black lines for geographic paths
+    geom_path(aes(x = location.long, y = location.lat), color = "black", size = 1.0) +
+    # Stork Locations: Points colored by time difference from fire event
+    geom_point(aes(x = location.long, y = location.lat, color = time_diff_hours), size = 2, alpha = 0.8) +
+    # Forest Fires: Triangles, colored with the same scale as stork locations
+    geom_point(aes(x = fire_longitude, y = fire_latitude, color = time_diff_hours), shape = 17, size = 3) +
+    # Apply color scale for time difference, making the legend horizontal
+    scale_color_viridis_c(name = "Time difference\n(hours from fire)", option = "C", limits = c(-12, 12), guide = guide_colourbar(direction = "horizontal", title.position = "top", title.hjust = 0.5)) +
+    labs(title = paste("Stork ID:", stork_id, "- Movement and Fire Events Within 12h Window")) +
+    theme_minimal() + theme(legend.position = "bottom")
+  
+  # Print the plot to the current PDF page
+  print(p)
+}
+
+# Close the PDF device
+dev.off()
+
+```
+# This code iterates through each unique stork identified by its tag and examines its movements in relation to each detected forest fire event. For each stork-forest fire interaction, it filters the stork's location data to a 24-hour window surrounding the fire event (12 hours before and after the fire's detection time). It then generates a detailed plot for each interaction, visualizing the stork's path as black lines and locations as points colored by their time difference from the fire event, with fire locations marked as colored triangles. Each plot represents a snapshot of the stork's behavior relative to a specific fire, aiming to highlight potential patterns or anomalies in movement that could indicate the stork's response to the fire. These plots are saved as individual PDF files within a subfolder named 'Event_Plots', organized by stork and fire IDs, to facilitate a focused and event-specific analysis of stork movements in the context of forest fires.
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# Create a subfolder for the output PDFs if it doesn't already exist
+output_folder <- "Event_Plots"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+# Iterate over each unique stork identifier
+for (stork_id in unique(Final_tracks_extended$tag.local.identifier)) {
+  
+  # Filter data for the current stork
+  stork_data <- Final_tracks_extended %>%
+    filter(tag.local.identifier == stork_id)
+  
+  # Identify unique fire events for the current stork
+  unique_fires <- unique(stork_data$Nearest_fire_ID)
+  
+  # Loop through each unique fire event
+  for (fire_id in unique_fires) {
+    
+    # Filter data for the specific fire event within a 24-hour window
+    event_data <- stork_data %>%
+      filter(Nearest_fire_ID == fire_id) %>%
+      mutate(time_diff = as.numeric(difftime(timestamp, fire_time, units = "hours"))) %>%
+      filter(abs(time_diff) <= 12)
+    
+    # Proceed only if there's data for the current event
+    if (nrow(event_data) > 0) {
+      
+      # Generate the plot
+      p <- ggplot(data = event_data) +
+        geom_path(aes(x = location.long, y = location.lat), color = "black", size = 0.5) +
+        geom_point(aes(x = location.long, y = location.lat, color = time_diff), size = 2, alpha = 0.8) +
+        geom_point(aes(x = fire_longitude, y = fire_latitude, color = time_diff), shape = 17, size = 3) +
+        scale_color_viridis_c(name = "Time diff from fire (hours)", option = "C") +
+        labs(title = paste("Stork ID:", stork_id, "Fire ID:", fire_id, "- Movement and Fire Event Analysis"),
+             x = "Longitude", y = "Latitude") +
+        theme_minimal()
+      
+      # Define the output file path
+      pdf_file_path <- sprintf("%s/Stork_%s_Fire_%s.pdf", output_folder, stork_id, fire_id)
+      
+      # Save the plot to a PDF file
+      ggsave(pdf_file_path, plot = p, device = "pdf", width = 10, height = 8)
+    }
+  }
+}
+
+```
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+library(lubridate)
+
+# Ensure the output folder exists
+output_folder <- "Bird_Tracks_Around_Fires"
+dir.create(output_folder, showWarnings = FALSE)
+
+pdf(paste0(output_folder, "/Bird_Fire_Tracks.pdf"), width = 11, height = 8)
+
+# Iterate over each fire event
+for (fire_id in unique(Final_tracks_extended$Nearest_fire_ID)) {
+  # Find the time of the fire event
+  fire_event_details <- Final_tracks_extended %>%
+    filter(Nearest_fire_ID == fire_id) %>%
+    summarise(fire_time = first(fire_time), 
+              fire_lat = first(fire_latitude), 
+              fire_long = first(fire_longitude)) %>%
+    distinct()
+
+  # Get all bird identifiers associated with this fire
+  bird_ids <- Final_tracks_extended %>%
+    filter(Nearest_fire_ID == fire_id) %>%
+    pull(tag.local.identifier) %>%
+    unique()
+
+  # Initialize plot
+  p <- ggplot() +
+    geom_point(aes(x = fire_long, y = fire_lat), data = fire_event_details, color = "red", size = 3, shape = 17) +
+    labs(title = paste("Bird Tracks Around Fire ID:", fire_id, "within 12-hour Window"),
+         x = "Longitude", y = "Latitude") +
+    theme_minimal()
+
+ # Loop through each bird to plot their tracks
+  for (bird_id in bird_ids) {
+    # Extract movement data for this bird within the 12h window around the fire event
+    bird_tracks <- stk_data %>%
+      filter(tag.local.identifier == bird_id) %>%
+      filter(between(timestamp, fire_event_details$fire_time - hours(12), fire_event_details$fire_time + hours(12)))
+
+    # Add to the plot if there is data
+    if (nrow(bird_tracks) > 0) {
+      # Note the change here from 'longitude' to 'location.long', and from 'latitude' to 'location.lat'
+      p <- p + geom_line(aes(x = location.long, y = location.lat, group = tag.local.identifier, color = as.factor(tag.local.identifier)), data = bird_tracks, size = 1)
+    }
+  }
+
+  p <- p + scale_color_viridis_d(end = 0.9, direction = 1, name = "Bird ID") +
+    guides(color = guide_legend(title = "Bird ID"))
+  
+  # Save the plot
+  print(p)
+}
+
+dev.off()  # Close the PDF device
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+#OLD CODE
+##Define Spatial-Temporal Matching Function for a single point in time 12h before fire detection
+```{r}
+#return the index (row number) in the forest fire dataset (ff_coords_time) that matched a stork location in stk_coords_time
+# Define the function to find spatial and temporal neighbors within a certain radius and time difference
+get_spat_temp_neighbors <- function(x, stk_coords_time, ff_coords_time, radius, daysdiff) {
+  Index <- seq_len(nrow(ff_coords_time))
+  
+  # Calculate time difference in seconds
+  time_diff_sec <- as.numeric(difftime(ff_coords_time[,3], stk_coords_time[x,3], units = "secs"))
+  
+  # Temporal proximity check considering 'daysdiff' as negative for time before the event
+  Temporal <- (time_diff_sec >= daysdiff * 86400) & (time_diff_sec <= 0) # Check if time is within 12 hours before the fire
+  
+  # Spatial proximity check using Haversine formula
+  Spatial <- spatialrisk:::haversine_loop_cpp(ff_coords_time[,c(1,2)], lat_center=stk_coords_time[x,2], lon_center=stk_coords_time[x,1], radius=radius)
+  
+  if (nrow(Spatial) == 0 || length(Temporal) == 0) {
+    Res <- NA
+  } else {
+    Out <- Index[(Index %in% Spatial$id) & Temporal]
+    Res <- if (length(Out) == 0) {
+      NA
+    } else {
+      if (length(Out) == 1) {
+        Out
+      } else {
+        Spatial$id[Spatial$id %in% Out][which.min(Spatial$distance_m[Spatial$id %in% Out])]
+      }
+    }
+  }
+  return(Res)
+}
+
+
+```
+
+##Find Spatial and Temporal Neighbors for a single point in time 12h before fire detection <--- TAKES FOREVER TO RUN
+```{r}
+# Find spatial and temporal neighbors within 50 meter and 12h before an overlap between ff and stk (50, -05)
+neighbors <- sapply(seq_len(nrow(stk_coords_time)), 
+                    FUN=function(x) get_spat_temp_neighbors(x, stk_coords_time, ff_coords_time, 50, -0.5))
+```
+
+
+##Extract neighbor data
+```{r}
+# Extract the data for stork movements that have neighbors
+neighbors_data <- stk_data[!is.na(neighbors),]
+
+
+# Add distance to the nearest fire and time to the nearest fire as separate columns
+neighbors_data$Dist2Fire <- st_distance(stk_data[!is.na(neighbors),], ff_data[neighbors[!is.na(neighbors)],], by_element = TRUE)
+
+```
+
+
+##Analyse neigbor data
+```{r}
+# Ensure ff_data has an identifiable, non-spatial ID column (if not already present)
+ff_data <- ff_data %>% 
+  mutate(fire_id = row_number()) 
+
+# Prepare fire data for joining by dropping geometry and selecting necessary columns
+ff_data_for_join <- ff_data %>% 
+  st_drop_geometry() %>%
+  select(fire_id, 
+         fire_longitude = longitude, 
+         fire_latitude = latitude, 
+         fire_time = acq_datetime, 
+         fire_confidence = confidence)
+
+# Create the final dataset with all required information, including fire details and time difference
+Final_tracks <- neighbors_data %>%
+  
+  # Add nearest fire ID from the non-NA values in 'neighbors'
+  mutate(Nearest_fire_ID = neighbors[!is.na(neighbors)]) %>%
+  
+  # Join with fire data to get details of the nearest fire
+  left_join(ff_data_for_join, by = c("Nearest_fire_ID" = "fire_id")) %>%
+  
+  # Calculate time difference between stork timestamp and fire acquisition time
+  mutate(TimeDiff2Fire = difftime(timestamp, 
+                                  ff_data_for_join$fire_time[Nearest_fire_ID]))
+
+
+# Optionally, filter based on a specific temporal threshold if necessary
+#Final_tracks <- Final_tracks %>%
+  #filter(TimeDiff2Fire >= as.difftime(-10, units = "days") & TimeDiff2Fire <= 0)
+
+
+# Save the final tracks data to a file
+write.csv(Final_tracks, 'Final_Tracks_Stork_Fire_Overlap.csv', row.names = FALSE)
+
+```
+
+
+#3. Plotting/Graphing
+##Plotting Stork Movements Relative to Forest Fires
+```{r}
+# Assuming Final_tracks contains the overlapping data between storks and forest fires
+
+for (i in 1:length(unique(Final_tracks$individual.local.identifier))) {
+  # Current forest fires associated with a particular stork
+  cur_fires <- unique(Final_tracks$fire_time[Final_tracks$individual.local.identifier == unique(Final_tracks$individual.local.identifier)[i]]) |> na.omit()
+  
+  # Filter tracks for the current stork
+  Track_cur <- filter(Final_tracks, individual.local.identifier == unique(individual.local.identifier)[i])
+  
+  # Calculate the days to the nearest forest fire
+  Track_cur$days2fire <- sapply(Track_cur$timestamp, function(x) as.numeric(max(difftime(x, cur_fires, units ='days'))))
+  
+  # Filter the data based on the desired time window relative to the fire events
+  Track_cur <- Track_cur |> filter(days2fire > (-60) & days2fire <(4))
+  
+  # Create a PDF for the plots
+  pdf(file=paste0(substr(unique(Final_tracks$individual.local.identifier)[i], 1, 4), '.lat_before_fire.pdf'), width=14)
+  par(mfrow=c(1,2))
+  
+  # Plot latitude over days to fire
+  plot(Track_cur$days2fire, st_coordinates(Track_cur)[,2], pch='+', main=paste("Stork ID:", unique(Track_cur$individual.local.identifier)[i]))
+  abline(v=0, col='red', lwd=2)
+  
+  # Adjust the time window for a more focused plot
+  Track_cur <- Track_cur |> filter(days2fire > (-15) & days2fire <(2))
+  plot(Track_cur$days2fire, st_coordinates(Track_cur)[,2], pch='+', main=paste("Stork ID:", unique(Track_cur$individual.local.identifier)[i]))
+  abline(v=0, col='red', lwd=2)
+  
+  dev.off()
+}
+```
+
+##plotting birdtrack and forestfire - only 12h before and 50m
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# Assuming stk_data is the full tracking data for storks and Final_tracks contains the overlap data
+
+# Filter the tracking data for the stork with tag.local.identifier 3609
+stork_track <- stk_data %>%
+  filter(tag.local.identifier == 3609)
+
+# Filter the Final_tracks for the fire event related to that stork
+stork_fire <- Final_tracks %>%
+  filter(tag.local.identifier == 3609)
+
+# Create the plot
+ggplot() +
+  geom_sf(data = stork_track, color = 'blue', size = 0.5) + # Plot the stork's track
+  geom_sf(data = stork_fire, color = 'red', size = 2) + # Highlight the fire event location
+  labs(title = 'Track of Stork with ID: 3609 with Forest Fire Location') +
+  theme_minimal() # Use a minimal theme for the plot
+
+
+```
+
+##plot of bird with tracking line
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# Assuming stk_data is the full tracking data for storks and Final_tracks contains the overlap data
+
+# Filter the tracking data for the stork with tag.local.identifier 3609 and arrange it by timestamp
+stork_track <- stk_data %>%
+  filter(tag.local.identifier == 3609) %>%
+  arrange(timestamp)
+
+# Filter the Final_tracks for the fire event related to that stork
+stork_fire <- Final_tracks %>%
+  filter(tag.local.identifier == 3609)
+
+# Create the plot
+ggplot(data = stork_track) +
+  geom_path(aes(x = location.long, y = location.lat, group = individual.local.identifier), color = 'blue', linewidth = 0.1) + # Draw lines connecting the points in order
+  geom_point(aes(x = location.long, y = location.lat), color = 'blue', size = 1.0) + # Plot the stork's positions
+  geom_point(data = stork_fire, aes(x = fire_longitude, y = fire_latitude), color = 'red', size = 2) + # Highlight the fire event location
+  labs(title = 'Track of Stork with ID: 3609 with Forest Fire Location') +
+  theme_minimal() # Use a minimal theme for the plot
+
+
+```
+
+
+#Analysis 2.0 for single birds
+```{r}
+# Assuming combined_stork_data is your dataframe and individual.local.identifier is the column name
+
+# Extract unique identifiers from the column
+unique_identifiers <- unique(combined_stork_data$individual.local.identifier)
+
+# Check how many unique identifiers there are
+number_of_unique_identifiers <- length(unique_identifiers)
+
+# Print the number of unique identifiers
+print(number_of_unique_identifiers)
+
+# Optionally, if you want to store this in a list (although a vector is usually sufficient for this purpose)
+unique_identifiers_list <- as.list(unique_identifiers)
+
+
+```
+
