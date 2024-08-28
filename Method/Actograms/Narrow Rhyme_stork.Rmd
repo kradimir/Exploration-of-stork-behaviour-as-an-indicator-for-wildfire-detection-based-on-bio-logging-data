@@ -1,0 +1,942 @@
+---
+title: "Narrow Rhytms_stork_ff"
+author: "Vladimir"
+date: "2023-12-14"
+output: html_document
+---
+
+file_path <- "D:/Vladimir/Narrowed down overlap analysis on few events/overlap analysis result_2/Overlap_Bruno_9705_E0661.csv"
+
+# Integrates fire data with bird tracking data to analyze overlaps
+```{r}
+#define filepath
+
+# Define the function to read and transform a CSV file
+load_and_transform_data <- function(file_path) {
+  # Read the CSV file
+  data <- read.csv(file_path, stringsAsFactors = FALSE)
+  
+  # Convert timestamp columns to POSIXct
+  data$timestamp <- as.POSIXct(data$timestamp, format = "%Y-%m-%d %H:%M:%S")
+  data$fire_time <- as.POSIXct(data$fire_time, format = "%Y-%m-%d %H:%M:%S")
+  
+  # Convert Dist2Fire to numeric and add units
+  data$Dist2Fire <- as.numeric(data$Dist2Fire)
+  data$Dist2Fire <- set_units(data$Dist2Fire, "m")
+  
+  # Ensure TimeDiff2Fire is numeric
+  data$TimeDiff2Fire <- as.numeric(data$TimeDiff2Fire)
+  
+  # Convert logical columns
+  data$interesting_event <- as.logical(data$interesting_event)
+  data$in_range <- as.logical(data$in_range)
+  data$Within_1km <- as.logical(data$Within_1km)
+  
+  # Recreate the geometry column for sf
+  #data <- st_as_sf(data, coords = c("location.long", "location.lat"), crs = 4326)
+  
+  return(data)
+}
+
+data <- load_and_transform_data(file_path)
+
+```
+
+### creating the object from: 2_estimate_movement.R 
+# This snippet sets up parallel processing to resample animal location data into consistent 5-minute intervals.
+# It uses 'parallel' for efficient computation and 'dplyr' for data manipulation, focusing on creating a gap-free, 
+# non-duplicated timeseries dataset for each unique animal. The process involves filtering data per animal, 
+# calculating and rounding intervals to the nearest 5 minutes, and selecting the closest timestamps to these intervals.
+# The objective is to prepare the dataset for further analysis by ensuring temporal consistency and removing duplicates.
+```{r}
+library(parallel)
+library(dplyr)
+
+# Assuming 'data' contains data with 'individual.local.identifier' and 'timestamp'
+unique_animals <- unique(data$individual.local.identifier)
+
+# Initialize an empty dataframe to store resampled data without gaps
+All_locs_no_gaps <- data.frame()
+
+# Set up a parallel cluster to utilize multiple CPU cores for faster processing
+# Detect the number of cores available and reserve one core for system processes to avoid overloading the system
+num_cores <- detectCores() - 1 # Leave one core free for system processes
+cl <- makeCluster(num_cores)
+
+
+# Use tryCatch to handle errors  during the parallel processing
+tryCatch({
+    # Loop through each unique animal identifier
+    for (animal in unique_animals) {
+        # Print the current animal being processed for tracking progress
+        cat(animal, '....')
+      
+        # Filter data for the current animal
+        Cur_locs <- filter(data, individual.local.identifier == animal)
+
+        # Store the total number of rows before resampling for comparison
+        rows_total <- nrow(Cur_locs)
+        
+        # Generate a sequence of 5-minute intervals between the first and last timestamp of the current animal's data
+        All_5_minute_intervals <- seq(from=min(Cur_locs$timestamp), to=max(Cur_locs$timestamp), by='5 min')
+        
+        # Convert timestamps to numeric format for easier interval calculation
+        all_timestamps <- as.numeric(Cur_locs$timestamp)
+        
+        # Calculate new rounded intervals for each timestamp to the nearest 5 minutes
+        all_intervals <- (all_timestamps + 150) %/% 300 * 300
+        # Remove duplicate intervals to avoid processing the same interval multiple times
+        all_intervals_unique <- unique(all_intervals)
+        
+        # Export the necessary variables to each worker in the cluster for independent processing
+        clusterExport(cl, varlist=c("all_intervals", "all_intervals_unique", "all_timestamps", "Cur_locs"), envir=environment())
+        
+        # Use parallel processing to find indices of the closest timestamps to each unique interval
+        Indices_to_use <- parSapply(cl, all_intervals_unique, function(x) {
+            # Identify timestamps closest to the current interval
+            Ind <- which(all_intervals == x)
+            # If multiple timestamps are equally close, choose the one with the smallest absolute difference
+            if (length(Ind) > 1) Ind[which.min(abs(all_timestamps[Ind] - x))]
+            else Ind
+        })
+        
+        # Check for and prevent duplicates after resampling
+        if (any(duplicated(Indices_to_use))) stop("Duplicates detected after resampling.")
+        
+        # Append the resampled data for the current animal to the main dataframe
+        All_locs_no_gaps <- rbind(All_locs_no_gaps, Cur_locs[Indices_to_use, ])
+
+        # Report how many rows were removed during the resampling process
+        cat('Deleted ', rows_total - length(Indices_to_use), ' from ', rows_total, '; ')
+    }
+}, error=function(e) {
+    # If an error occurs, print the error message
+    cat("Error during processing:", e$message, "\n")
+})
+
+# After processing all animals, stop the cluster to free up system resources
+stopCluster(cl)
+
+######check to see if there's at least one overlap for each bird (individual.local.identifier')
+birds_with_fire_overlap <- All_locs_no_gaps %>%
+  group_by(individual.local.identifier) %>%
+  filter(interesting_event == TRUE)
+
+# This will give you a dataframe of unique birds that have at least one fire_overlap = TRUE
+print(birds_with_fire_overlap)
+######END OF CHECK
+
+
+
+```
+
+##### Takes a long time to run  ######THIS DATASET DOESNT SEEMS TO HAVE DUPLICATE
+# This snippet deduplicates the dataset 'All_locs_no_gaps' by ensuring uniqueness across 'individual.local.identifier' and 'timestamp', 
+# using 'dplyr' for data manipulation and 'sp' for potential spatial data handling.
+```{r}
+library(dplyr)
+library(sf)
+
+
+# Deduplicates 'All_locs_no_gaps' ensuring each animal identifier and timestamp combination is unique.
+# Keeps all other data columns intact with '.keep_all = TRUE'. Essential for accurate temporal-spatial analysis, 
+# avoiding bias or errors from repeated records.
+All_locs_no_gaps <- All_locs_no_gaps %>% distinct(individual.local.identifier, timestamp, .keep_all = TRUE)
+```
+
+# This calculates time differences, filters records based on time intervals, computes distances and speeds between records, 
+# and cleans up the dataset for final analysis. It uses 'dplyr' for data manipulation and 'sp' for spatial calculations, ensuring 
+# a dataset ready for spatial-temporal analysis.
+```{r}
+
+# Calculate time differences between consecutive records to identify movement intervals.
+All_locs_no_gaps <- All_locs_no_gaps %>%
+  arrange(individual.local.identifier, timestamp) %>%  # Sort data by animal ID and timestamp.
+  group_by(individual.local.identifier) %>%  # Group data by each animal.
+  mutate(Time_diff = c(diff(as.numeric(timestamp)), NA))  # Calculate time differences between consecutive points.
+
+# Exclude records that are less than 2.5 minutes apart to reduce noise and focus on significant movements.
+All_locs_no_gaps <- All_locs_no_gaps %>%
+  filter(if_else(row_number() == 1, TRUE, Time_diff/60 >= 2.5))  # Keep the first record and those spaced by at least 2.5 minutes.
+
+# Enhance data with date information, next point IDs, and decision flags for keeping records based on day boundaries and unique IDs.
+All_locs_no_gaps$date <- format(All_locs_no_gaps$timestamp, format='%Y-%m-%d')  # Add formatted date column.
+All_locs_no_gaps <- All_locs_no_gaps %>%
+  mutate(
+    Next_ID = lead(individual.local.identifier),  # Identify the next record's ID to check for day boundaries.
+    Next_Date = lead(date),  # Identify the next record's date.
+    Keep = if_else(individual.local.identifier == Next_ID & date == Next_Date, TRUE, FALSE)  # Flag records to keep based on same day and ID.
+  )
+
+
+# Convert sf object to regular dataframe for distance calculation can be reverted lower
+All_locs_no_gaps_df <- as.data.frame(All_locs_no_gaps)
+
+# This snippet transforms the spatial dataset into a regular dataframe to calculate distances between consecutive points and the speed of movement for each record flagged for inclusion. 
+# It specifically addresses records marked 'Keep', calculating the direct distance to the next point, the time difference between records, and deriving the speed of movement. 
+# This conversion from a spatial to a regular dataframe facilitates the use of non-spatial distance calculation methods, 
+# allowing for the handling of spatial data in scenarios where spatial functionality is not required for immediate calculations.
+
+All_locs_no_gaps_df$Dist_to_next <- if_else(
+  All_locs_no_gaps_df$Keep,
+  c(sp::spDists(as.matrix(All_locs_no_gaps_df[c("location.long", "location.lat")]), longlat = TRUE, segments = TRUE), NA),
+  NA
+)
+
+All_locs_no_gaps_df$Time_diff <- if_else(
+  All_locs_no_gaps_df$Keep,
+  c(diff(as.numeric(All_locs_no_gaps_df$timestamp)), NA),
+  NA
+)
+
+All_locs_no_gaps_df$Speed <- if_else(
+  !is.na(All_locs_no_gaps_df$Time_diff) & All_locs_no_gaps_df$Time_diff > 0,
+  All_locs_no_gaps_df$Dist_to_next / All_locs_no_gaps_df$Time_diff,
+  NA
+)
+
+# Optional: Convert back to sf object if needed for spatial operations later
+# All_locs_no_gaps <- st_as_sf(All_locs_no_gaps_df, coords = c("location.long", "location.lat"), crs = 4326)
+
+
+# Save the cleaned and processed data frame
+#save(All_locs_no_gaps, file='All_locs_no_gaps_all_lifetrack_and_old_05_05_2020.RData')
+
+# load if needed
+#load('All_locs_no_gaps_all_lifetrack_and_old_05_05_2020.RData')
+
+# Basic plot to visualize the data
+#plot(location.lat ~ location.long, data = All_locs_no_gaps, pch = '.')
+
+# Final structure check
+str(All_locs_no_gaps)
+
+
+```
+
+# This segment groups and summarizes the dataset by individual and date, calculating the total record count and the proportion of time intervals under 7.5 minutes.
+# It highlights data frequency and regularity, crucial for assessing data collection consistency across the dataset.
+# A specific individual's data is inspected for quality checks, and a histogram visualizes the distribution of time interval proportions, offering insights into the overall data recording frequency.
+# This approach helps identify high-frequency data collection periods, ensuring the dataset's completeness and reliability for further analysis.
+```{r}
+# Group by individual identifier and date, then calculate the proportion of records where the time difference is less than 7.5 minutes
+tmp_5 <- All_locs_no_gaps_df %>%
+  group_by(date) %>%
+  summarize(
+    n = n(),
+    p_less_than_5 = sum(Time_diff < 7.5 * 300, na.rm = TRUE) / n
+  )
+
+
+
+# Create a histogram to visualize the distribution of the proportion of time differences less than 7.5 minutes
+hist(tmp_5$p_less_than_5, breaks = 100)
+
+
+```
+
+# This part refines the dataset by filtering records based on nearly continuous data collection (over 95% of intervals under 7.5 minutes), ensuring high data quality.
+# The filtered dataset is cleaned by removing summary columns no longer needed post-filtering, streamlining it for subsequent analyses.
+# A scatter plot is generated to visually assess the spatial coverage of the filtered data, verifying that essential geographical patterns are maintained.
+```{r}
+All_locs_no_gaps_good_birddates <- All_locs_no_gaps_df %>%
+  inner_join(tmp_5, by = c("date")) %>%
+  filter(p_less_than_5 > 0.85) %>%
+  select(-p_less_than_5, -n)
+
+# I allowed 0.85 because most of data was above that
+
+```
+
+# This segment conducts a movement analysis within the dataset by identifying significant movements—defined as transitions exceeding 30 meters between consecutive records. Initially, it distinguishes these significant movements and delineates the start and end points of each movement event. Following the identification, it constructs a detailed summary encompassing the start and end times, geographical coordinates, and the calculated duration and distance of each movement. This summary not only reveals the dynamics of each movement but also enables the computation of movement speed, offering insights into the velocity of travel. The culmination of this analysis is the generation of a plot visualizing the start points of these movements, serving as a spatial exploration tool to discern underlying patterns or behaviors. This meticulous process refines the dataset for subsequent analytical endeavors, ensuring a focus on periods characterized by significant locomotive behavior, thus enriching spatial-temporal analyses and preserving the integrity of the data narrative.
+```{r}
+# Estimating movements based on distance greater than 30 meters between consecutive points
+
+# Identify indices where there is a significant movement (distance greater than 30 meters and not NA)
+Moved_Index<-which(!is.na(All_locs_no_gaps_good_birddates$Dist_to_next) & All_locs_no_gaps_good_birddates$Dist_to_next>0.03) # over 30 meters.. 
+length(Moved_Index) # 3312601 movements
+
+# Create a logical vector indicating where significant movements occur
+Movement_logical<-!is.na(All_locs_no_gaps_good_birddates$Dist_to_next) &All_locs_no_gaps_good_birddates$Dist_to_next>0.03
+
+# Convert the logical vector to numeric for use with coldiffs in Rfast
+Movement_logical_num<-as.numeric(Movement_logical)
+
+#install.packages('Rfast')
+library(Rfast)
+
+# Identify the start of a movement
+All_starts<-which(coldiffs(cbind(c(0,Movement_logical_num),c(Movement_logical_num, 0)))==1)
+
+# Identify the end of a movement
+#All_starts<-which(apply(cbind(c(0,Movement_logical_num),c(Movement_logical_num, 0)), 1, diff)==1)
+All_ends<-which(coldiffs(cbind(c(0,Movement_logical_num),c(Movement_logical_num, 0)))==-1)
+
+# Create a dataframe summarizing each movement with start/end time, location, and IDs
+Movements<-data.frame(
+    Individual=All_locs_no_gaps_good_birddates$individual.local.identifier[All_starts],
+	Start.time=All_locs_no_gaps_good_birddates$timestamp[All_starts],
+	Start.id=All_starts,
+	End.time=All_locs_no_gaps_good_birddates$timestamp[All_ends],
+	End.id=All_ends,
+	Duration=All_locs_no_gaps_good_birddates$timestamp[All_ends]-All_locs_no_gaps_good_birddates$timestamp[All_starts],
+	Start_long=All_locs_no_gaps_good_birddates$location.long[All_starts],
+	Start_lat=All_locs_no_gaps_good_birddates$location.lat[All_starts]
+	)
+	 
+# Initialize distance for each movement to NA
+Movements$Distance=NA
+# Calculate total distance for each movement period (start to end)
+Movements$Distance<-apply(Movements, 1, FUN=function(x) sum(All_locs_no_gaps_good_birddates$Dist_to_next[x[3]:(as.numeric(x[5])-1)]))
+
+# Convert start and end times to Julian dates for easier handling
+Movements$Start.jdate<-as.Date(Movements$Start.time)
+Movements$End.jdate<-as.Date(Movements$End.time)
+Movements_all<- Movements
+
+# Save the detailed movements data for further analysis
+str(Movements_all) # 959992 # 879363 with old data # 768601 movements
+
+# Visualize start locations of movements to understand spatial patterns
+plot(Movements_all$Start_lat~Movements_all$Start_long)
+
+# Calculate the speed of each movement in meters per minute
+Movements_all$Speed<-Movements_all$Distance/as.numeric(Movements_all$Duration)*60
+
+#save(Movements_all, file='Movements_all_no_annotation_28_03_2024.RData')
+
+```
+##Snippet to know which bird has an overlap with forestfire using the 'individual.local.identifier'
+```{r} 
+library(dplyr)
+
+# Assuming your dataset is named All_locs_no_gaps_good_birddates
+birds_with_fire_overlap <- All_locs_no_gaps_good_birddates %>%
+  group_by(individual.local.identifier) %>%
+  summarize(has_fire_overlap = any(fire_overlap == TRUE), .groups = 'drop') %>%
+  filter(has_fire_overlap == TRUE)
+
+# This will give you a dataframe of unique birds that have at least one fire_overlap = TRUE
+print(birds_with_fire_overlap)
+```
+##Visual analysis of the distribution of fire_overlap and bird -timestamp- data
+```{r} 
+library(ggplot2)
+library(dplyr)
+
+# Ensure the 'individuals' list is up-to-date
+individuals <- unique(All_locs_no_gaps_good_birddates$individual.local.identifier)
+
+# Process each individual
+for (cur_animal in individuals) {
+  cat("Processing: ", cur_animal, "\n")
+  
+  # Subset the data for the current animal
+  data_cur_animal <- All_locs_no_gaps_good_birddates %>%
+    filter(individual.local.identifier == cur_animal)
+  
+  # Aggregate data by date for total records and fire overlap records
+  daily_data <- data_cur_animal %>%
+    group_by(date) %>%
+    summarize(
+      Total_Records = n(),
+      Within_1km_Records = sum(Within_1km, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  # Convert 'date' from character/factor to Date type for plotting
+  daily_data$date <- as.Date(daily_data$date)
+
+  # Generate the plot
+  p <- ggplot(daily_data, aes(x = date)) +
+    geom_col(aes(y = Total_Records, fill = "Total Records"), position = "identity", alpha = 0.5) +
+    geom_col(aes(y = Within_1km_Records, fill = "Fire Overlap Records"), position = "identity", alpha = 0.5) +
+    labs(
+      title = paste("Data Distribution for", cur_animal),
+      x = "Date",
+      y = "Number of Records",
+      fill = "Record Type"
+    ) +
+    scale_fill_manual(values = c("Total Records" = "blue", "Fire Overlap Records" = "red")) +
+    theme_minimal()
+  
+  # Print the plot
+  print(p)
+}
+
+```
+
+###Start of rhythms code
+```{r Setup and Libraries for rhythm plot} 
+
+library(suntools)
+library(sf)
+library(tidyr)
+
+# Extract the names of the individuals from the sorted table
+individuals <- unique(All_locs_no_gaps_good_birddates$individual.local.identifier)
+
+
+```
+
+###ACTOGRAM WITH FF OVERLAP POINTS
+```{r Main Loop and Sunrise/Sunset Calculations for rhythm plot}
+
+
+for (cur_animal in individuals) {
+  cat("Processing: ", cur_animal, '\n')
+  
+  Dataset_bird_cur <- All_locs_no_gaps_good_birddates %>%
+    filter(individual.local.identifier == cur_animal) %>%
+    select(location.long, location.lat, timestamp, Within_1km, interesting_event, Dist2Fire) %>%
+    drop_na()
+
+  Dataset_bird_cur$timestamp <- as.POSIXct(Dataset_bird_cur$timestamp, tz='UTC')
+  
+  # Calculate sunrise and sunset times
+  sunrise_results <- sunriset(
+    crds = cbind(Dataset_bird_cur$location.long, Dataset_bird_cur$location.lat),
+    dateTime = Dataset_bird_cur$timestamp,
+    direction = "sunrise",
+    POSIXct.out = TRUE
+  )
+  Dataset_bird_cur$sunrise_time <- sunrise_results$time
+
+  sunset_results <- sunriset(
+    crds = cbind(Dataset_bird_cur$location.long, Dataset_bird_cur$location.lat),
+    dateTime = Dataset_bird_cur$timestamp,
+    direction = "sunset",
+    POSIXct.out = TRUE
+  )
+  Dataset_bird_cur$sunset_time <- sunset_results$time
+
+  Dataset_bird_cur$year_day <- paste0(format(Dataset_bird_cur$timestamp, format='%Y'), '.', format(Dataset_bird_cur$timestamp, format='%j'))
+
+  # Identify interesting events and create 10-day windows
+  interesting_events <- Dataset_bird_cur %>%
+    filter(interesting_event == TRUE)
+
+  for (i in 1:nrow(interesting_events)) {
+    event_time <- interesting_events$timestamp[i]
+    start_time <- event_time - days(3)
+    end_time <- event_time + days(3)
+    
+    Dataset_bird_event <- Dataset_bird_cur %>%
+      filter(timestamp >= start_time & timestamp <= end_time)
+    
+    # Calculate closest sunrises and sunsets
+    closest_sunrises <- Dataset_bird_event %>%
+      group_by(year_day) %>%
+      mutate(time_diff = abs(as.numeric(sunrise_time - timestamp))) %>%
+      filter(row_number() == which.min(time_diff)) %>%
+      pull(sunrise_time)
+
+    closest_sunsets <- Dataset_bird_event %>%
+      group_by(year_day) %>%
+      mutate(time_diff = abs(as.numeric(sunset_time - timestamp))) %>%
+      filter(row_number() == which.min(time_diff)) %>%
+      pull(sunset_time)
+
+    cur_time <- Dataset_bird_event$timestamp
+    cur_time_start <- as.POSIXct(Movements_all$Start.time[Movements_all$Individual == cur_animal], tz='UTC')
+    cur_time_end <- as.POSIXct(Movements_all$End.time[Movements_all$Individual == cur_animal], tz='UTC')
+    cur_speeds <- Movements_all$Speed[Movements_all$Individual == cur_animal]
+    
+    par(mfrow = c(2, 1), mar = c(0, 4, 1, 1))
+    
+    plot(c(min(as.numeric(format(cur_time_start, format='%H'))) - 1, max(as.numeric(format(cur_time_start, format='%H'))) + 2) ~ range(cur_time), pch = '.', cex = 2, col = 'blue', main = paste(cur_animal, " Event at ", event_time), type = 'n', ylab = 'day hour', xlab = 'Time')
+    abline(v = seq(as.POSIXct('2012/01/01'), as.POSIXct('2020/01/01'), by = 'month'), col = grey(0.9), lwd = 1)
+    abline(h = c(0:24), col = grey(0.9), lwd = 1)
+    
+    #Slowest: Green (#008837)
+    #Fastest: Purple (#7b3294)
+    #Speed_Colors <- colorRampPalette(rev(c('#7b3294', '#c2a5cf', '#ffffbf', '#a6dba0', '#008837')), bias = 1)
+    
+    
+    #Slowest: blue (#2b83ba)
+    #Fastest: red (#d53e4f)
+    Speed_Colors <- colorRampPalette(rev(c('#d53e4f', '#fc8d59', '#ffff73', '#abdda4', '#2b83ba')), bias = 1)
+
+    
+    Breaks <- c(min(Movements_all$Speed, na.rm = TRUE), quantile(Movements_all$Speed, seq(0.1, 0.9, by = 0.1), na.rm = TRUE), max(Movements_all$Speed, na.rm = TRUE))
+    
+    #lwd is the size of the line
+    segments(y0 = as.numeric(format(cur_time_start, format='%H')) + as.numeric(format(cur_time_start, format='%M')) / 60, y1 = as.numeric(format(cur_time_end, format='%H')) + as.numeric(format(cur_time_end, format='%M')) / 60, x0 = cur_time_start, x1 = cur_time_end, pch = '2', lwd = 20, col = Speed_Colors(length(Breaks) - 1)[findInterval(cur_speeds, Breaks)])
+    
+    # Adding fire point which change size depending on distance to fire
+    Dataset_bird_event$Dist2Fire_numeric <- as.numeric(Dataset_bird_event$Dist2Fire)
+    fire_point_size <- 1 / Dataset_bird_event$Dist2Fire_numeric * 80  # Adjust the multiplier for better visualization
+    
+    # Plot red dots when within_1km is TRUE
+    points(as.numeric(format(Dataset_bird_event$timestamp[Dataset_bird_event$Within_1km == TRUE], format='%H')) + as.numeric(format(Dataset_bird_event$timestamp[Dataset_bird_event$Within_1km == TRUE], format='%M')) / 60 ~ Dataset_bird_event$timestamp[Dataset_bird_event$Within_1km == TRUE], pch = 20, col = 'black', cex = fire_point_size[Dataset_bird_event$Within_1km == TRUE])
+    
+    # Plot dashes when within_1km is FALSE with a constant size
+    points(as.numeric(format(Dataset_bird_event$timestamp[Dataset_bird_event$Within_1km == FALSE], format='%H')) + as.numeric(format(Dataset_bird_event$timestamp[Dataset_bird_event$Within_1km == FALSE], format='%M')) / 60 ~ Dataset_bird_event$timestamp[Dataset_bird_event$Within_1km == FALSE], pch = '-', col = 'black', cex = 1.5)
+    
+    # Add blue crosses for interesting events
+    points(as.numeric(format(interesting_events$timestamp, format='%H')) + as.numeric(format(interesting_events$timestamp, format='%M')) / 60 ~ interesting_events$timestamp, pch = 4, col = 'red', cex = 1, lwd = 2)
+
+    #lines for sunset/sunrise
+    lines(as.numeric(format(closest_sunrises, format='%H')) + as.numeric(format(closest_sunrises, format='%M')) / 60 ~ closest_sunrises, col = 'brown', lwd = 2)
+    lines(as.numeric(format(closest_sunsets, format='%H')) + as.numeric(format(closest_sunsets, format='%M')) / 60 ~ closest_sunsets, col = 'brown', lwd = 2)
+    
+    par(mar = c(4, 4, 1, 1))
+    plot(location.lat ~ timestamp, data = Dataset_bird_event, type = 'n')
+    abline(v = seq(as.POSIXct('2012/01/01'), as.POSIXct('2020/01/01'), by = 'month'), col = grey(0.9), lwd = 1)
+    points(location.lat ~ timestamp, data = Dataset_bird_event, pch = '.', cex = 3)
+  }
+}
+ 
+
+```
+
+
+# test
+```{r Main Loop and Sunrise/Sunset Calculations for rhythm plot}
+
+
+for (cur_animal in individuals) {
+  cat("Processing: ", cur_animal, '\n')
+  
+  Dataset_bird_cur <- All_locs_no_gaps_good_birddates %>%
+    filter(individual.local.identifier == cur_animal) %>%
+    select(location.long, location.lat, timestamp, Within_1km, interesting_event) %>%
+    drop_na()
+
+  Dataset_bird_cur$timestamp <- as.POSIXct(Dataset_bird_cur$timestamp, tz='UTC')
+  
+  # Calculate sunrise and sunset times
+  sunrise_results <- sunriset(
+    crds = cbind(Dataset_bird_cur$location.long, Dataset_bird_cur$location.lat),
+    dateTime = Dataset_bird_cur$timestamp,
+    direction = "sunrise",
+    POSIXct.out = TRUE
+  )
+  Dataset_bird_cur$sunrise_time <- sunrise_results$time
+
+  sunset_results <- sunriset(
+    crds = cbind(Dataset_bird_cur$location.long, Dataset_bird_cur$location.lat),
+    dateTime = Dataset_bird_cur$timestamp,
+    direction = "sunset",
+    POSIXct.out = TRUE
+  )
+  Dataset_bird_cur$sunset_time <- sunset_results$time
+
+  Dataset_bird_cur$year_day <- paste0(format(Dataset_bird_cur$timestamp, format='%Y'), '.', format(Dataset_bird_cur$timestamp, format='%j'))
+
+  # Identify interesting events and create 10-day windows
+  interesting_events <- Dataset_bird_cur %>%
+    filter(interesting_event == TRUE)
+
+  for (i in 1:nrow(interesting_events)) {
+    event_time <- interesting_events$timestamp[i]
+    start_time <- event_time - days(2)
+    end_time <- event_time + days(2)
+    
+    Dataset_bird_event <- Dataset_bird_cur %>%
+      filter(timestamp >= start_time & timestamp <= end_time)
+    
+    # Calculate closest sunrises and sunsets
+    closest_sunrises <- Dataset_bird_event %>%
+      group_by(year_day) %>%
+      mutate(time_diff = abs(as.numeric(sunrise_time - timestamp))) %>%
+      filter(row_number() == which.min(time_diff)) %>%
+      pull(sunrise_time)
+
+    closest_sunsets <- Dataset_bird_event %>%
+      group_by(year_day) %>%
+      mutate(time_diff = abs(as.numeric(sunset_time - timestamp))) %>%
+      filter(row_number() == which.min(time_diff)) %>%
+      pull(sunset_time)
+
+    cur_time <- Dataset_bird_event$timestamp
+    cur_time_start <- as.POSIXct(Movements_all$Start.time[Movements_all$Individual == cur_animal], tz='UTC')
+    cur_time_end <- as.POSIXct(Movements_all$End.time[Movements_all$Individual == cur_animal], tz='UTC')
+    cur_speeds <- Movements_all$Speed[Movements_all$Individual == cur_animal]
+    
+    par(mfrow = c(2, 1), mar = c(0, 4, 1, 1))
+    
+    plot(c(min(as.numeric(format(cur_time_start, format='%H'))) - 1, max(as.numeric(format(cur_time_start, format='%H'))) + 2) ~ range(cur_time), pch = '.', cex = 2, col = 'blue', main = paste(cur_animal, " Event at ", event_time), type = 'n', ylab = 'day hour', xlab = 'Time')
+    abline(v = seq(as.POSIXct('2012/01/01'), as.POSIXct('2020/01/01'), by = 'month'), col = grey(0.9), lwd = 1)
+    abline(h = c(0:24), col = grey(0.9), lwd = 1)
+    
+    Speed_Colors <- colorRampPalette(rev(c('#7b3294', '#c2a5cf', '#f7f7f7', '#a6dba0', '#008837')), bias = 1)
+    Breaks <- c(min(Movements_all$Speed, na.rm = TRUE), quantile(Movements_all$Speed, seq(0.1, 0.9, by = 0.1), na.rm = TRUE), max(Movements_all$Speed, na.rm = TRUE))
+    
+    #lwd is the size of the line
+    segments(y0 = as.numeric(format(cur_time_start, format='%H')) + as.numeric(format(cur_time_start, format='%M')) / 60, y1 = as.numeric(format(cur_time_end, format='%H')) + as.numeric(format(cur_time_end, format='%M')) / 60, x0 = cur_time_start, x1 = cur_time_end, pch = '.', lwd = 10, col = Speed_Colors(length(Breaks) - 1)[findInterval(cur_speeds, Breaks)])
+    
+    fire_overlap_points <- Dataset_bird_event %>%
+      filter(Within_1km == TRUE)
+    
+    fire_overlap_points$timestamp_rounded <- floor_date(fire_overlap_points$timestamp, unit = "1 hour")
+    
+    unique_fire_overlap_points <- fire_overlap_points[!duplicated(fire_overlap_points$timestamp_rounded), ]
+    
+    points(as.numeric(format(fire_overlap_points$timestamp_rounded, format='%H')) + as.numeric(format(fire_overlap_points$timestamp_rounded, format='%M')) / 60 ~ fire_overlap_points$timestamp_rounded, pch = '-', col = 'red', cex = 1.5)
+    
+    # Add red crosses for interesting events
+    points(as.numeric(format(interesting_events$timestamp, format='%H')) + as.numeric(format(interesting_events$timestamp, format='%M')) / 60 ~ interesting_events$timestamp, pch = 4, col = 'red', cex = 2, lwd = 2)
+    
+    lines(as.numeric(format(closest_sunrises, format='%H')) + as.numeric(format(closest_sunrises, format='%M')) / 60 ~ closest_sunrises, col = 'red', lwd = 2)
+    lines(as.numeric(format(closest_sunsets, format='%H')) + as.numeric(format(closest_sunsets, format='%M')) / 60 ~ closest_sunsets, col = 'red', lwd = 2)
+    
+    par(mar = c(4, 4, 1, 1))
+    plot(location.lat ~ timestamp, data = Dataset_bird_event, type = 'n')
+    abline(v = seq(as.POSIXct('2012/01/01'), as.POSIXct('2020/01/01'), by = 'month'), col = grey(0.9), lwd = 1)
+    points(location.lat ~ timestamp, data = Dataset_bird_event, pch = '.', cex = 3)
+  }
+}
+ 
+
+```
+
+
+
+```{r}
+
+```
+
+###ACTOGRAM WITHOUT FF OVERLAP CROSSES
+```{r Main Loop and Sunrise/Sunset Calculations for rhythm plot}
+
+for (cur_animal in individuals) {
+  cat("Processing: ", cur_animal, '\n')
+
+  pdf(file = paste0("C:/Master thesis data/stork_rythms_plots/", make.names(paste0(cur_animal, '_rythms_reason_of_death_', unique(Movements_all$Reason_of_death[Movements_all$Individual == cur_animal]), '.pdf'))),
+      width = 12, height = 7)
+
+  # Filtering step
+  Dataset_bird_cur <- All_locs_no_gaps_good_birddates %>%
+    filter(individual.local.identifier == cur_animal) %>%
+    select(location.long, location.lat, timestamp) %>%
+    drop_na()
+
+  Dataset_bird_cur$timestamp <- as.POSIXct(Dataset_bird_cur$timestamp, tz='UTC')
+
+  
+###### ADDED CODE
+  # Calculate sunrise and sunset (extract time directly)
+  sunrise_results <- sunriset(
+    crds = cbind(Dataset_bird_cur$location.long, Dataset_bird_cur$location.lat),
+    dateTime = Dataset_bird_cur$timestamp,
+    direction = "sunrise",
+    POSIXct.out = TRUE
+  )
+  Dataset_bird_cur$sunrise_time <- sunrise_results$time
+
+  sunset_results <- sunriset(
+    crds = cbind(Dataset_bird_cur$location.long, Dataset_bird_cur$location.lat),
+    dateTime = Dataset_bird_cur$timestamp,
+    direction = "sunset",
+    POSIXct.out = TRUE
+  )
+  Dataset_bird_cur$sunset_time <- sunset_results$time
+###### END OF ADDED CODE
+
+  
+  # Add year_day column to Dataset_bird_cur
+  Dataset_bird_cur$year_day <- paste0(format(Dataset_bird_cur$timestamp, format='%Y'), '.', format(Dataset_bird_cur$timestamp, format='%j'))
+
+  # Calculate closest_sunrises and closest_sunsets 
+  closest_sunrises <- Dataset_bird_cur %>%
+    group_by(year_day) %>%
+    mutate(time_diff = abs(as.numeric(sunrise_time - timestamp))) %>% 
+    filter(row_number() == which.min(time_diff)) %>%
+    pull(sunrise_time) 
+
+ closest_sunsets <- Dataset_bird_cur %>%
+    group_by(year_day) %>%
+    mutate(time_diff = abs(as.numeric(sunset_time - timestamp))) %>% 
+    filter(row_number() == which.min(time_diff)) %>%
+    pull(sunset_time) 
+
+ 
+###Plotting
+ 
+  cur_time<-Dataset_bird_cur$timestamp
+  
+  
+  cur_time_start<-as.POSIXct(Movements_all$Start.time[Movements_all$Individual==cur_animal], tz='UTC')
+  cur_time_end<-as.POSIXct(Movements_all$End.time[Movements_all$Individual==cur_animal], tz='UTC')
+  
+  cur_speeds<-Movements_all$Speed[Movements_all$Individual==cur_animal]
+  
+  
+  # Set plotting parameters: 2 rows, 1 column for plots, and adjust margins
+  par(mfrow=c(2,1), mar=c(0,4,1,1))
+  
+  
+  # Initialize a blank plot with specified x and y ranges
+  # X-axis range is based on the range of 'cur_time'
+  # Y-axis is from one hour before the earliest 'cur_time_start' to two hours after the latest 'cur_time_start'
+  # 'type = n' means no points or lines are plotted yet
+  plot(c(min(as.numeric(format(cur_time_start, format='%H')))-1, max(as.numeric(format(cur_time_start, format='%H')))+2) ~range(cur_time), pch='.', cex=2, col='blue', main=paste(cur_animal), type='n', ylab='day hour', xlab='Time') 
+  
+  # Add vertical grid lines at the start of each month from 2012 to 2020
+  abline(v=seq(as.POSIXct('2012/01/01'), as.POSIXct('2020/01/01'), by='month'), col=grey(0.9), lwd=1)
+  
+  # Add horizontal grid lines for each hour of the day
+  abline(h=c(0:24), col=grey(0.9), lwd=1)
+  
+  
+  #cur_time<-as.POSIXct(All_locs_no_gaps$timestamp[All_locs_no_gaps$individual.local.identifier==cur_animal], tz='UTC')
+  
+  #points(as.numeric(format(cur_time, format='%H'))+as.numeric(format(cur_time, format='%M'))/60~cur_time, pch='.', col='black', cex=2) 
+  
+  #points(as.numeric(format(cur_time, format='%H'))+as.numeric(format(cur_time, format='%M'))/60~cur_time, pch='.', col=grey(0.9), cex=2) 
+  #  also now want to color the schedules by the speed..
+  # for that I need ot 
+  #segments(y0=as.numeric(format(cur_time_start, format='%H'))+as.numeric(format(cur_time_start, format='%M'))/60, y1=as.numeric(format(cur_time_end, format='%H'))+as.numeric(format(cur_time_end, format='%M'))/60, x0=cur_time_start, x1=cur_time_end, pch='.', col='black', lwd=2) 
+  
+  #abline(v=as.POSIXct(dead_date, format='%m/%d/%Y'), col='red')
+  # add end date for this bird..
+  
+  
+  # Create a palette of colors for visualizing speeds, from purple to green
+  Speed_Colors<-colorRampPalette(rev(c('#7b3294',
+                                       '#c2a5cf',
+                                       '#f7f7f7',
+                                       '#a6dba0',
+                                       '#008837')), bias=1)
+  
+  # Define breaks for speed quantiles to categorize movement speeds
+  Breaks=c(min(Movements_all$Speed, na.rm=TRUE), quantile(Movements_all$Speed, seq(0.1, 0.9, by=0.1), na.rm=TRUE) ,max(Movements_all$Speed, na.rm=TRUE))
+  
+  # Plot segments representing movements, colored by speed category
+  segments(y0=as.numeric(format(cur_time_start, format='%H'))+as.numeric(format(cur_time_start, format='%M'))/60, y1=as.numeric(format(cur_time_end, format='%H'))+as.numeric(format(cur_time_end, format='%M'))/60, x0=cur_time_start, x1=cur_time_end, pch='.',lwd=2, col=Speed_Colors(length(Breaks)-1)[findInterval(cur_speeds, Breaks)]) 
+  
+  # Add lines representing closest sunrises to the plot, colored red
+  lines(as.numeric(format(closest_sunrises, format='%H'))+as.numeric(format(closest_sunrises, format='%M'))/60~closest_sunrises, col='red', lwd=2)
+  
+  # Add lines representing closest sunsets to the plot, colored red
+  lines(as.numeric(format(closest_sunsets, format='%H'))+as.numeric(format(closest_sunsets, format='%M'))/60~closest_sunsets, col='red', lwd=2)
+  
+#Second plot: Reset the margin parameters to default
+  par( mar=c(4,4,1,1))
+  
+  # Initialize a second blank plot for latitude over time
+  plot(location.lat~ timestamp  , data=Dataset_bird_cur, type='n')
+  #par(xpd=TRUE)
+  
+  # Add vertical grid lines at the start of each month from 2012 to 2020 for the second plot
+  abline(v=seq(as.POSIXct('2012/01/01'), as.POSIXct('2020/01/01'), by='month'), col=grey(0.9), lwd=1)
+  #par(xpd=FALSE)
+  
+  # Plot points for latitude over time on the second plot
+  points(location.lat~ timestamp  , data=Dataset_bird_cur, pch='.')
+  
+  dev.off()
+}	
+ 
+
+```
+
+
+#TEST OF ADDING A BOOLEAN VALUE TO NOTICE FIRE EVENTS AND ADD THEM IN THE PLOT
+
+###Start of rhythms code
+```{r Setup and Libraries for rhythm plot} 
+
+#install.packages('suntools')
+#install.packages("sp")
+
+#setwd('C:/Master thesis data')
+
+#load environmnent if needed
+#load("C:/Master thesis data/AA_28_03_2024_Rythms_environment.RData")
+
+library(suntools)
+library(sp)
+
+###Data Filtering and Preprocessing
+
+# Count occurrences of each individual
+Tab <- table(Movements_all$Individual)
+# Sort the table in decreasing order of occurrence
+sorted_Tab <- sort(Tab, decreasing = TRUE)
+
+# Extract the names of the individuals from the sorted table
+individuals <- names(sorted_Tab)
+
+
+```
+
+```{r Main Loop and Sunrise/Sunset Calculations for rhythm plot}
+
+for (cur_animal in individuals) {
+  cat("Processing: ", cur_animal, '\n')
+
+  pdf(file = paste0("C:/Master thesis data/stork_rythms_plots/", make.names(paste0(cur_animal, '_rythms_reason_of_death_', unique(Movements_all$Reason_of_death[Movements_all$Individual == cur_animal]), '.pdf'))),
+      width = 12, height = 7)
+
+  # Filtering step
+  Dataset_bird_cur <- All_locs_no_gaps_good_birddates %>%
+    filter(individual.local.identifier == cur_animal) %>%
+    select(location.long, location.lat, timestamp, Nearest_fire_ID) %>%
+    drop_na(location.long, location.lat, timestamp)
+
+   # Modify the Dataset_bird_cur to include 'initial_fire_event' column
+  Dataset_bird_cur <- Dataset_bird_cur %>%
+    arrange(timestamp) %>% # Ensure the data is in chronological order
+    group_by(Nearest_fire_ID) %>%
+    mutate(initial_fire_event = !duplicated(Nearest_fire_ID) & !is.na(Nearest_fire_ID)) %>%
+    ungroup() # Remove the grouping
+  
+  Dataset_bird_cur$timestamp <- as.POSIXct(Dataset_bird_cur$timestamp, tz='UTC')
+
+  
+###### ADDED CODE
+  # Calculate sunrise and sunset (extract time directly)
+  sunrise_results <- sunriset(
+    crds = cbind(Dataset_bird_cur$location.long, Dataset_bird_cur$location.lat),
+    dateTime = Dataset_bird_cur$timestamp,
+    direction = "sunrise",
+    POSIXct.out = TRUE
+  )
+  Dataset_bird_cur$sunrise_time <- sunrise_results$time
+
+  sunset_results <- sunriset(
+    crds = cbind(Dataset_bird_cur$location.long, Dataset_bird_cur$location.lat),
+    dateTime = Dataset_bird_cur$timestamp,
+    direction = "sunset",
+    POSIXct.out = TRUE
+  )
+  Dataset_bird_cur$sunset_time <- sunset_results$time
+###### END OF ADDED CODE
+
+  
+  # Add year_day column to Dataset_bird_cur
+  Dataset_bird_cur$year_day <- paste0(format(Dataset_bird_cur$timestamp, format='%Y'), '.', format(Dataset_bird_cur$timestamp, format='%j'))
+
+  # Calculate closest_sunrises and closest_sunsets 
+  closest_sunrises <- Dataset_bird_cur %>%
+    group_by(year_day) %>%
+    mutate(time_diff = abs(as.numeric(sunrise_time - timestamp))) %>% 
+    filter(row_number() == which.min(time_diff)) %>%
+    pull(sunrise_time) 
+
+ closest_sunsets <- Dataset_bird_cur %>%
+    group_by(year_day) %>%
+    mutate(time_diff = abs(as.numeric(sunset_time - timestamp))) %>% 
+    filter(row_number() == which.min(time_diff)) %>%
+    pull(sunset_time) 
+
+ 
+###Plotting
+ 
+  cur_time<-Dataset_bird_cur$timestamp
+  
+  
+  cur_time_start<-as.POSIXct(Movements_all$Start.time[Movements_all$Individual==cur_animal], tz='UTC')
+  cur_time_end<-as.POSIXct(Movements_all$End.time[Movements_all$Individual==cur_animal], tz='UTC')
+  
+  cur_speeds<-Movements_all$Speed[Movements_all$Individual==cur_animal]
+  
+  
+  # Set plotting parameters: 2 rows, 1 column for plots, and adjust margins
+  par(mfrow=c(2,1), mar=c(0,4,1,1))
+  
+  
+  # Initialize a blank plot with specified x and y ranges
+  # X-axis range is based on the range of 'cur_time'
+  # Y-axis is from one hour before the earliest 'cur_time_start' to two hours after the latest 'cur_time_start'
+  # 'type = n' means no points or lines are plotted yet
+  plot(c(min(as.numeric(format(cur_time_start, format='%H')))-1, max(as.numeric(format(cur_time_start, format='%H')))+2) ~range(cur_time), pch='.', cex=2, col='blue', main=paste(cur_animal), type='n', ylab='day hour', xlab='Time') 
+  
+  # Add vertical grid lines at the start of each month from 2012 to 2020
+  abline(v=seq(as.POSIXct('2012/01/01'), as.POSIXct('2020/01/01'), by='month'), col=grey(0.9), lwd=1)
+  
+  # Add horizontal grid lines for each hour of the day
+  abline(h=c(0:24), col=grey(0.9), lwd=1)
+  
+  
+  #cur_time<-as.POSIXct(All_locs_no_gaps$timestamp[All_locs_no_gaps$individual.local.identifier==cur_animal], tz='UTC')
+  
+  #points(as.numeric(format(cur_time, format='%H'))+as.numeric(format(cur_time, format='%M'))/60~cur_time, pch='.', col='black', cex=2) 
+  
+  #points(as.numeric(format(cur_time, format='%H'))+as.numeric(format(cur_time, format='%M'))/60~cur_time, pch='.', col=grey(0.9), cex=2) 
+  #  also now want to color the schedules by the speed..
+  # for that I need ot 
+  #segments(y0=as.numeric(format(cur_time_start, format='%H'))+as.numeric(format(cur_time_start, format='%M'))/60, y1=as.numeric(format(cur_time_end, format='%H'))+as.numeric(format(cur_time_end, format='%M'))/60, x0=cur_time_start, x1=cur_time_end, pch='.', col='black', lwd=2) 
+  
+  #abline(v=as.POSIXct(dead_date, format='%m/%d/%Y'), col='red')
+  # add end date for this bird..
+  
+  
+  # Create a palette of colors for visualizing speeds, from purple to green
+  Speed_Colors<-colorRampPalette(rev(c('#7b3294',
+                                       '#c2a5cf',
+                                       '#f7f7f7',
+                                       '#a6dba0',
+                                       '#008837')), bias=1)
+  
+  # Define breaks for speed quantiles to categorize movement speeds
+  Breaks=c(min(Movements_all$Speed, na.rm=TRUE), quantile(Movements_all$Speed, seq(0.1, 0.9, by=0.1), na.rm=TRUE) ,max(Movements_all$Speed, na.rm=TRUE))
+  
+  # Plot segments representing movements, colored by speed category
+  segments(y0=as.numeric(format(cur_time_start, format='%H'))+as.numeric(format(cur_time_start, format='%M'))/60, y1=as.numeric(format(cur_time_end, format='%H'))+as.numeric(format(cur_time_end, format='%M'))/60, x0=cur_time_start, x1=cur_time_end, pch='.',lwd=2, col=Speed_Colors(length(Breaks)-1)[findInterval(cur_speeds, Breaks)]) 
+  
+  # Add lines representing closest sunrises to the plot, colored red
+  lines(as.numeric(format(closest_sunrises, format='%H'))+as.numeric(format(closest_sunrises, format='%M'))/60~closest_sunrises, col='red', lwd=2)
+  
+  # Add lines representing closest sunsets to the plot, colored red
+  lines(as.numeric(format(closest_sunsets, format='%H'))+as.numeric(format(closest_sunsets, format='%M'))/60~closest_sunsets, col='red', lwd=2)
+  
+#Second plot: Reset the margin parameters to default
+  par( mar=c(4,4,1,1))
+  
+  # Initialize a second blank plot for latitude over time
+  plot(location.lat~ timestamp  , data=Dataset_bird_cur, type='n')
+  #par(xpd=TRUE)
+  
+  # Add vertical grid lines at the start of each month from 2012 to 2020 for the second plot
+  abline(v=seq(as.POSIXct('2012/01/01'), as.POSIXct('2020/01/01'), by='month'), col=grey(0.9), lwd=1)
+  #par(xpd=FALSE)
+  
+  # Plot points for latitude over time on the second plot
+  points(location.lat~ timestamp  , data=Dataset_bird_cur, pch='.')
+  
+  dev.off()
+}	
+ 
+
+```
+
+
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
