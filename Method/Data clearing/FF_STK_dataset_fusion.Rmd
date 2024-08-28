@@ -1,0 +1,529 @@
+---
+title: "FF_STK_dataset_fusion"
+author: "Vladimir"
+date: "2024-04-15"
+output: html_document
+---
+```{r setting up environment}
+#super heavz
+#load("D:/Vladimir/FF_STK_dataset_fusion_15_04_2024.RData")
+```
+
+```{r setting up environment}
+setwd("C:/Master thesis data/FF_STK_dataset_fusion")
+
+# Install packages if not already installed
+if (!require("tidyverse")) install.packages("tidyverse")
+install.packages("data.table")
+install.packages("dplyr")
+
+install.packages("ggplot2") 
+# Load necessary libraries
+library(data.table)
+library(readr)
+library(dplyr)
+library(rlang)
+library(lubridate)  # For working with dates and times
+library(sf)  # For spatial data operations
+
+
+```
+
+###### FIRST, we start by uploading and dataclearing the stork datasets
+# This loop reads specified CSV files, subsets for certain columns, converts 'event.id' to numeric, and assigns each dataset to a uniquely named variable in the global environment
+
+# NOT NEEDED Upload all the datafrom the files (light version)
+```{r}
+
+# Define file paths and the respective names you want for the data frames
+file_info <- setNames(
+  c("C:/Master thesis data/Storks/LifeTrack White Stork South Africa.csv",
+    "C:/Master thesis data/Storks/LifeTrack White Stork Sicily.csv",
+    "C:/Master thesis data/Storks/LifeTrack White Stork Greece Evros Delta.csv",
+    "C:/Master thesis data/Storks/LifeTrack White Stork Armenia.csv",
+    "C:/Master thesis data/Storks/LifeTrack White Stork Poland.csv",
+    "C:/Master thesis data/Storks/LifeTrack White Stork Tunisia.csv",
+    "C:/Master thesis data/Storks/LifeTrack White Stork Kosova.csv",
+    "C:/Master thesis data/Storks/LifeTrack White Stork Moscow.csv",
+    "C:/Master thesis data/Storks/LifeTrack White Stork Poland ECG.csv"),
+  c("stork_data_South_Africa", "stork_data_Sicily", "stork_data_Greece_Evros_Delta",
+    "stork_data_Armenia", "stork_data_Poland", "stork_data_Tunisia",
+    "stork_data_Kosova", "stork_data_Moscow", "stork_data_Poland_ECG")
+)
+
+# Columns to keep
+columns_to_keep <- c("event.id", "timestamp", "location.long", "location.lat", 
+                     "individual.local.identifier", "study.name")
+
+# Loop through the file_info list to read, subset, and convert data types
+for (data_name in names(file_info)) {
+  # Read the CSV file
+  temp_data <- read.csv(file_info[data_name])
+  
+  # Subset columns
+  if (all(columns_to_keep %in% names(temp_data))) {
+    temp_data <- temp_data[, columns_to_keep]
+    
+    # Convert event.id to numeric
+    temp_data$event.id <- as.numeric(temp_data$event.id)
+    
+    # Assign the cleaned data to its respective variable in the global environment
+    assign(data_name, temp_data, envir = .GlobalEnv)
+  } else {
+    cat(sprintf("The dataset %s is missing one or more of the required columns and has been skipped.\n", data_name))
+  }
+}
+
+
+```
+
+
+
+
+# Upload ALL the data from the files (heavy version)
+```{r}
+#Can load that instead of running to code below
+load("D:/Vladimir/FFSTKDataset_fusion/fulls_stork_file_uploaded_environment.RData")
+
+# Define the directory containing the CSV files
+directory_path <- "C:/Master thesis data/Storks"
+
+# Get a list of all CSV files in the directory
+file_paths <- list.files(path = directory_path, pattern = "\\.csv$", full.names = TRUE)
+
+# Create a named vector where names are generated dynamically based on file names
+file_info <- setNames(
+  file_paths,
+  gsub(pattern = "LifeTrack_White_Stork_", replacement = "stork_data_", 
+       gsub(pattern = " ", replacement = "_", 
+            gsub(pattern = "\\.csv$", replacement = "", basename(file_paths))))
+)
+
+# Columns to keep
+columns_to_keep <- c("event.id", "timestamp", "location.long", "location.lat", 
+                     "individual.local.identifier")
+
+# Loop through the file_info list to read, subset, and convert data types
+for (data_name in names(file_info)) {
+  # Read the CSV file
+  temp_data <- read.csv(file_info[data_name])
+  
+  # Subset columns
+  if (all(columns_to_keep %in% names(temp_data))) {
+    temp_data <- temp_data[, columns_to_keep]
+    
+    # Convert event.id to numeric
+    temp_data$event.id <- as.numeric(temp_data$event.id)
+    
+    # Assign the cleaned data to its respective variable in the global environment
+    assign(data_name, temp_data, envir = .GlobalEnv)
+  } else {
+    cat(sprintf("The dataset %s is missing one or more of the required columns and has been skipped.\n", data_name))
+  }
+}
+
+```
+
+### loop to modify the name (bc there was a naming problem) ### CAN SKIP if load("D:/Vladimir/FFSTKDataset_fusion/fulls_stork_file_uploaded_environment.RData") is loaded in
+```{r}
+# List all datasets currently in the environment
+current_names <- ls(pattern = "LifeTrack_White_Stork_")
+
+# Function to create new names based on the current ones
+new_names <- gsub(pattern = "LifeTrack_White_Stork_", replacement = "stork_data_",
+                  gsub(pattern = " ", replacement = "_", current_names))
+
+# Loop through current names and assign them new names
+for (i in seq_along(current_names)) {
+  assign(new_names[i], get(current_names[i]))
+  rm(list = current_names[i])  # Remove the old object
+}
+
+# Optionally, list the new names to confirm the change
+print(ls(pattern = "^stork_data_"))
+
+```
+
+
+# Display column names and data types for each dataset starting with "stork_data_" 
+```{r}
+get_column_info <- function(df) {
+  data.frame(Column = names(df), Type = sapply(df, class), row.names = NULL)
+}
+
+# Retrieve all variables that start with 'stork_data_' and print their column information
+dataframe_names <- ls(pattern = "^stork_data_")
+dataframes <- mget(dataframe_names)
+
+for (data_name in dataframe_names) {
+  cat("\nColumn Information for:", data_name, "\n")
+  print(get_column_info(dataframes[[data_name]]))
+}
+
+```
+
+
+# Extract identifiers (event.id, individual.local.identifier) from datasets with names starting with "stork_data_" and add dataset labels for tracking. ### CAN SKIP if not data clearing
+```{r}
+# Retrieve all variables that start with 'stork_data_' and get their identifiers
+dataframe_names <- ls(pattern = "^stork_data_")
+dataframes <- mget(dataframe_names)
+
+# Function to get identifiers with dataset labels
+get_identifiers_with_labels <- function(id_column) {
+  all_ids <- do.call(rbind, lapply(names(dataframes), function(name) {
+    data <- dataframes[[name]][, id_column, drop = FALSE]
+    data$dataset <- name  # Add a column indicating the source dataset
+    return(data)
+  }))
+  return(all_ids)
+}
+
+# Get identifiers with dataset labels
+all_event_ids_with_labels <- get_identifiers_with_labels("event.id")
+all_individual_ids_with_labels <- get_identifiers_with_labels("individual.local.identifier")
+
+
+# Function to check for cross-dataset duplicates
+check_cross_dataset_duplicates <- function(ids) {
+  # Aggregate by identifier, listing datasets each identifier appears in
+  aggregated_ids <- aggregate(dataset ~ ., data = ids, FUN = function(x) paste(unique(x), collapse = ", "))
+  # Find identifiers that appear in more than one dataset
+  cross_dataset_duplicates <- aggregated_ids[grep(",", aggregated_ids$dataset), ]
+  return(nrow(cross_dataset_duplicates) > 0)
+}
+
+# Run checks
+has_cross_dataset_duplicated_event.id <- check_cross_dataset_duplicates(all_event_ids_with_labels)
+has_cross_dataset_duplicated_individual.local.identifier <- check_cross_dataset_duplicates(all_individual_ids_with_labels)
+
+# Print results
+cat("Are there event.id duplicated across different datasets? ", has_cross_dataset_duplicated_event.id, "\n")
+cat("Are there individual.local.identifier duplicated across different datasets? ", has_cross_dataset_duplicated_individual.local.identifier, "\n")
+
+
+### event.id AND individual.local.identifier ARE UNIQUE
+```
+
+#NEXT STEP IS combining all datasets in one
+```{r}
+# Retrieve all the dataframes
+dataframe_names <- ls(pattern = "^stork_data_")
+dataframes <- mget(dataframe_names)
+
+# Combine all dataframes into one
+combined_stork_data <- do.call(rbind, dataframes)
+
+# Optionally, add row names or reset them to ensure uniqueness
+rownames(combined_stork_data) <- NULL
+
+# Check the structure of the combined dataframe
+str(combined_stork_data)
+
+# Save the combined dataset to a CSV file for further use
+#write.csv(combined_stork_data, "D:/Vladimir/combined_stork_data.csv", row.names = FALSE)
+
+# Check for duplicate in event.id within combined_stork_data
+any(duplicated(combined_stork_data$event.id)) 
+
+# çlean environment from dataset which start with stork_data
+# List all objects that start with 'stork_data_'
+dataframes_to_remove <- ls(pattern = "^stork_data_")
+
+# Remove the listed data frames from the environment
+rm(list=dataframes_to_remove)
+rm(dataframes)
+rm(temp_data)
+
+```
+### Based from other analysis we only want to keep dates from 2020 ("2019-12-01 00:12:00", tz = "UTC") onward so we filter that out
+### Filter 'combined_stork_data' to only keep data post 2020
+```{r}
+# to load what is done below
+# load("D:/Vladimir/FF_STK_dataset_fusion_ONLY_combined_stork_Data_post_2020_environment.RData")
+
+# Convert the timestamp to POSIXct
+combined_stork_data$timestamp <- as.POSIXct(combined_stork_data$timestamp, format="%Y-%m-%d %H:%M:%S", tz="UTC")
+
+# Filter the data to keep only records from "2019-12-01 00:12:00" UTC onwards
+combined_stork_data <- combined_stork_data[combined_stork_data$timestamp >= as.POSIXct("2019-12-01 00:12:00", tz="UTC"), ]
+
+# free up memory
+gc()
+
+# after filtering 25900815 row
+
+
+```
+# To load combined_stork_data from a csv or from environment and trying the make df lighter
+```{r}
+#Normal long
+#load("D:/Vladimir/FF_STK_dataset_fusion_ONLY_combined_stork_Data_environment.RData")
+
+# Drop the study.name column
+#combined_stork_data <- combined_stork_data %>% select(-study.name)
+
+#very long
+#combined_stork_data <- read.csv("D:/Vladimir/combined_stork_data.csv")
+
+#install.packages("data.table")
+library(data.table)
+dt <- as.data.table(combined_stork_data)
+
+#delete combined stork data to free RAM
+rm(combined_stork_data)
+
+```
+
+# Need to adjust the data to the right type for further analysis
+```{r}
+#here I use 'dt' because 'combined_stork_data' is too heavy but dt can be replaces with combined_stork_data
+load("D:/Vladimir/FF_STK_dataset_fusion_dt_instead_of_df.RData")
+
+
+library(data.table)
+library(sf)
+
+# Convert timestamp to POSIXct format if it's not already
+dt[, timestamp := as.POSIXct(timestamp, format = "%Y-%m-%d %H:%M:%S", tz = 'UTC')]
+
+# Remove rows where location.long or location.lat is NA
+dt <- dt[!is.na(location.long) & !is.na(location.lat)]
+
+# Convert the data.table to an sf object
+#dt_sf <- st_as_sf(dt, coords = c("location.long", "location.lat"), crs = 4326, agr = "constant", remove = FALSE)
+
+
+# Save the combined dataset to a CSV file for further use
+#write.csv(combined_stork_data, "D:/Vladimir/combined_stork_data.csv", row.names = FALSE)
+
+
+```
+
+
+### same as the one above but with combined_stork_data and not dt
+```{r}
+#here I use 'dt' because 'combined_stork_data' is too heavy but dt can be replaces with combined_stork_data
+#load("D:/Vladimir/FF_STK_dataset_fusion_ONLY_combined_stork_Data_environment.RData")
+
+
+library(dplyr)
+library(sf)
+
+# Modify the combined stork tracking data for spatial analysis
+combined_stork_data <- combined_stork_data %>%
+
+  # Ensure timestamp is in POSIXct format (if not already)
+  #mutate(timestamp = as.POSIXct(timestamp, format="%Y-%m-%d %H:%M:%S", tz='UTC')) %>%
+ 
+  # Remove rows where location.long or location.lat is NA
+  filter(!is.na(location.long) & !is.na(location.lat)) %>%
+  
+  # Convert the stork tracking data to an 'sf' object to enable spatial analysis
+  # Using WGS 84 (EPSG:4326) coordinate reference system
+  st_as_sf(coords = c("location.long", "location.lat"), crs = 4326, agr = "constant", remove = FALSE)
+
+
+# Save the combined dataset to a CSV file for further use
+#write.csv(combined_stork_data, "D:/Vladimir/combined_stork_data.csv", row.names = FALSE)
+
+
+```
+
+
+###### DATA CLEARED FOR BIRD TRACKS JUST NEED TO SCALE UP WITH ALL DATASET THEN WE CAN PROCESS THEM IN FF_STK_overlap_analysis
+
+
+
+### START OF DATACLEARING FOR FOREST FIRE download at: https://firms.modaps.eosdis.nasa.gov/download/ use "VIIRS S-NPP 375m: Temporal Coverage: 20 January 2012 - present" or "VIIRS NOAA-20 375m: Temporal Coverage: 1 January 2020 - present"
+## HERE WE USED: "VIIRS S-NPP 375m: Temporal Coverage: 2019-12-01 - 2023-12-31" in csv format
+
+#First we need to know from know the timeframe present in the stork data by searching for the earliest and latest 'dates' 
+```{r}
+library(ggplot2)
+
+# Retry the ggplot histogram
+ggplot(dt, aes(x = date)) +
+  geom_histogram(binwidth = 365,  # Set bin width to one year
+                 color = "black", fill = "blue") +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +  # Set breaks and labels to one year
+  labs(title = "Distribution of Records Over Time for all Stork data",
+       x = "Date",
+       y = "Number of Records") +
+  theme_minimal()  # Use a minimal theme
+
+```
+
+# Saving (pdf) plot of the distribution of data
+```{r}
+# To save as png in folder
+# Set the path and filename for the output plot
+pdf(file = "D:\\Vladimir\\Plot\\stork_histogram.pdf", width = 8, height = 6)
+hist(dt$date, breaks = "months", main = "Distribution of Records Over Time for all Stork data", xlab = "Date", ylab = "Number of Records")
+dev.off()  # Make sure this command is executed
+
+# To save as png in folder
+# Set the path and filename for the output plot
+pdf(file = "D:\\Vladimir\\Plot\\stork_histogram_yearly.pdf", width = 8, height = 6)
+
+ggplot(dt, aes(x = date)) +
+  geom_histogram(binwidth = 365,  # Set bin width to one year
+                 color = "black", fill = "blue") +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +  # Set breaks and labels to one year
+  labs(title = "Distribution of Records Over Time for all Stork data",
+       x = "Date",
+       y = "Number of Records") +
+  theme_minimal()  # Use a minimal theme
+
+dev.off()  # Make sure this command is executed
+
+
+```
+
+### The most amount of consitent data starts in 2020 so we shall start the analysis from 2020
+### We will download data for the forest fire from 2020 onward for the regions 
+
+## FOREST FIRE download at: https://firms.modaps.eosdis.nasa.gov/download/
+## Area of Interest: -19.3,-18.4,69.6,70.7
+## Date Range: 2019-12-01 to 2023-12-31
+## Data Format: .csv
+## Data source: suomi-viirs-c2 (VIIRS S-NPP 375m)
+
+### UPDATES CODE with ff data from 2020 onward in df_ff
+### there's 2 .csv uploaded because some data is more rescent than other so we have to bind them together
+```{r}
+# can upload what is done below by doing
+# load("D:/Vladimir/FF_STK_dataset_fusion_ff_stk_2020_onward.RData")
+
+# Load necessary libraries
+library(dplyr)
+library(sf)
+library(lubridate)  # For handling date-times
+
+# Define the paths to the CSV files
+archive_file_path <- "D:/Vladimir/FF_custom_region_data/2020 onward/DL_FIRE_SV-C2_2020-2024/fire_archive_SV-C2_461780.csv"
+nrt_file_path <- "D:/Vladimir/FF_custom_region_data/2020 onward/DL_FIRE_SV-C2_2020-2024/fire_nrt_SV-C2_461780.csv"
+
+# Load necessary libraries
+library(dplyr)
+library(sf)
+library(lubridate)  # For handling date-times
+
+# Define a function to read, transform, and return an sf data frame
+preprocess_and_convert_to_sf <- function(file_path) {
+  read.csv(file_path, colClasses = c("acq_time" = "character")) %>%
+    select(latitude, longitude, brightness, acq_date, acq_time, confidence) %>%
+    mutate(acq_datetime = as.POSIXct(paste(acq_date, acq_time), format = "%Y-%m-%d %H%M", tz = 'UTC')) %>%
+    st_as_sf(coords = c("longitude", "latitude"), crs = 4326, agr = "constant", remove = FALSE)
+}
+
+# Process the first file and assign to 'df_ff'
+df_ff <- preprocess_and_convert_to_sf("D:/Vladimir/FF_custom_region_data/2020 onward/DL_FIRE_SV-C2_2020-2024/fire_archive_SV-C2_461780.csv")
+
+# Read and process the second file, then combine with 'df_ff', and remove the temporary variable
+df_ff <- bind_rows(df_ff, preprocess_and_convert_to_sf("D:/Vladimir/FF_custom_region_data/2020 onward/DL_FIRE_SV-C2_2020-2024/fire_nrt_SV-C2_461780.csv"))
+
+# Now 'df_ff' contains the combined data from both files
+
+# View the structure of the newly created 'sf' object
+str(df_ff)
+
+```
+
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+
+
+```
+
+
+```{r}
+
+
+```
+### OLD CODE WITH DATA FROM 2013/1/1 and 2020/09/16
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(sf)
+library(lubridate)  # For handling date-times if not already loaded
+
+# Read the CSV file and preprocess it
+custome_Wf <- read.csv("D:/Vladimir/FF_custom_region_data/fire_archive_SV-C2_456943.csv", colClasses = c("acq_time"="character")) %>%
+  
+  # Filter to only keep the specified columns
+  select(latitude, longitude, brightness, acq_date, acq_time, confidence) %>%
+  
+  # Convert the acquisition date and time into a POSIXct object for accurate temporal analysis
+  mutate(acq_datetime = as.POSIXct(paste(acq_date, acq_time), format="%Y-%m-%d %H%M", tz='UTC')) %>%
+  
+  # Convert the dataset to an 'sf' object for spatial operations, using WGS 84 CRS
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, agr = "constant", remove = FALSE)
+
+# View the structure of the newly created 'sf' object
+str(custome_Wf)
+```
+
+
+# dataset Upload template
+```{r}
+# Reading a CSV file from the Storks subdirectory
+stork_data_Uzbe <- read.csv("C:/Master thesis data/Storks/LifeTrack White Stork Uzbekistan.csv")
+
+# Read each CSV file into a separate variable using the full path
+stork_data_South_Africa <- read.csv("C:/Master thesis data/Storks/LifeTrack White Stork South Africa.csv")
+stork_data_Sicily <- read.csv("C:/Master thesis data/Storks/LifeTrack White Stork Sicily.csv")
+stork_data_Greece_Evros_Delta <- read.csv("C:/Master thesis data/Storks/LifeTrack White Stork Greece Evros Delta.csv")
+stork_data_Armenia <- read.csv("C:/Master thesis data/Storks/LifeTrack White Stork Armenia.csv")
+stork_data_Poland <- read.csv("C:/Master thesis data/Storks/LifeTrack White Stork Poland.csv")
+stork_data_Tunisia <- read.csv("C:/Master thesis data/Storks/LifeTrack White Stork Tunisia.csv")
+stork_data_Kosova <- read.csv("C:/Master thesis data/Storks/LifeTrack White Stork Kosova.csv")
+stork_data_Moscow <- read.csv("C:/Master thesis data/Storks/LifeTrack White Stork Moscow.csv")
+stork_data_Poland_ECG <- read.csv("C:/Master thesis data/Storks/LifeTrack White Stork Poland ECG.csv")
+
+```
