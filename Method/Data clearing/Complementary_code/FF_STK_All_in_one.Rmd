@@ -1,0 +1,1078 @@
+---
+title: "All_in_one"
+author: "Vladimir"
+date: "2024-04-23"
+output: html_document
+---
+# 1. Data clearing ######################################################
+### The premis of the code is that based on ealiers analysis we will use data from 2020 ("2019-12-01 00:12:00", tz = "UTC") onward (because stork data quality is lesser before that and we need to keep datasets lights for processing)
+### stork data is called 'combined_stork_data'(it combined all stork data available) and ff data is called 'df_ff'(geographic limitations are based on where the stork travel)
+# firest set up
+```{r setting up environment}
+#setwd("D:/Vladimir/Vladimir/All_in_one_codes")
+
+# List of all required packages
+packages <- c("tidyverse", "data.table", "dplyr", "rlang", "lubridate", "sf", "spatialrisk", "readr", "readxl", "move2", 
+              "suntools", "tidyr", "ggplot2", "Rfast", "parallel")
+
+# Install missing packages
+new_packages <- packages[!(packages %in% installed.packages()[, "Package"])]
+if (length(new_packages)) install.packages(new_packages)
+
+# Specific check for 'rlang' version 1.1.2 or higher
+if (!("rlang" %in% installed.packages()[,"Package"]) || packageVersion("rlang") < "1.1.2") {
+  install.packages("rlang")
+}
+
+# Load all the required packages
+lapply(packages, library, character.only = TRUE)
+
+# Confirm the version of 'rlang' to ensure it meets the requirements
+#rlang_version <- packageVersion("rlang")
+#print(paste("rlang version:", rlang_version))
+
+```
+
+### You can CTRL-F "START HERE" if you have 'FF_STK_dataset_fusion_ONLY_combined_stork_Data_post_2020_environment.RData'
+### Else follow until there (long process due to heavy datasets)
+
+# Upload ALL the data from the files
+```{r}
+#Can load that instead of running to code below
+#load("D:/Vladimir/FF_STKDataset_fusion/fulls_stork_file_uploaded_environment.RData")
+
+# Define the directory containing the CSV files
+directory_path <- "C:/Master thesis data/Storks"
+
+# Get a list of all CSV files in the directory
+file_paths <- list.files(path = directory_path, pattern = "\\.csv$", full.names = TRUE)
+
+# Create a named vector where names are generated dynamically based on file names
+file_info <- setNames(
+  file_paths,
+  gsub(pattern = "LifeTrack_White_Stork_", replacement = "stork_data_", 
+       gsub(pattern = " ", replacement = "_", 
+            gsub(pattern = "\\.csv$", replacement = "", basename(file_paths))))
+)
+
+# Columns to keep
+columns_to_keep <- c("event.id", "timestamp", "location.long", "location.lat", 
+                     "individual.local.identifier")
+
+# Loop through the file_info list to read, subset, and convert data types
+for (data_name in names(file_info)) {
+  # Read the CSV file
+  temp_data <- read.csv(file_info[data_name])
+  
+  # Subset columns
+  if (all(columns_to_keep %in% names(temp_data))) {
+    temp_data <- temp_data[, columns_to_keep]
+    
+    # Convert event.id to numeric
+    temp_data$event.id <- as.numeric(temp_data$event.id)
+    
+    # Assign the cleaned data to its respective variable in the global environment
+    assign(data_name, temp_data, envir = .GlobalEnv)
+  } else {
+    cat(sprintf("The dataset %s is missing one or more of the required columns and has been skipped.\n", data_name))
+  }
+}
+
+```
+
+### loop to modify the name ### CAN SKIP if load("D:/Vladimir/FF_STKDataset_fusion/fulls_stork_file_uploaded_environment.RData") is loaded in
+```{r}
+# List all datasets currently in the environment
+current_names <- ls(pattern = "LifeTrack_White_Stork_")
+
+# Function to create new names based on the current ones
+new_names <- gsub(pattern = "LifeTrack_White_Stork_", replacement = "stork_data_",
+                  gsub(pattern = " ", replacement = "_", current_names))
+
+# Loop through current names and assign them new names
+for (i in seq_along(current_names)) {
+  assign(new_names[i], get(current_names[i]))
+  rm(list = current_names[i])  # Remove the old object
+}
+
+# Optionally, list the new names to confirm the change
+print(ls(pattern = "^stork_data_"))
+
+```
+
+# Display column names and data types for each dataset starting with "stork_data_" 
+```{r}
+get_column_info <- function(df) {
+  data.frame(Column = names(df), Type = sapply(df, class), row.names = NULL)
+}
+
+# Retrieve all variables that start with 'stork_data_' and print their column information
+dataframe_names <- ls(pattern = "^stork_data_")
+dataframes <- mget(dataframe_names)
+
+for (data_name in dataframe_names) {
+  cat("\nColumn Information for:", data_name, "\n")
+  print(get_column_info(dataframes[[data_name]]))
+}
+
+```
+
+# Extract identifiers (event.id, individual.local.identifier) from datasets with names starting with "stork_data_" and add dataset labels for tracking. 
+### CAN SKIP if not data clearing
+```{r}
+# Retrieve all variables that start with 'stork_data_' and get their identifiers
+dataframe_names <- ls(pattern = "^stork_data_")
+dataframes <- mget(dataframe_names)
+
+# Function to get identifiers with dataset labels
+get_identifiers_with_labels <- function(id_column) {
+  all_ids <- do.call(rbind, lapply(names(dataframes), function(name) {
+    data <- dataframes[[name]][, id_column, drop = FALSE]
+    data$dataset <- name  # Add a column indicating the source dataset
+    return(data)
+  }))
+  return(all_ids)
+}
+
+# Get identifiers with dataset labels
+all_event_ids_with_labels <- get_identifiers_with_labels("event.id")
+all_individual_ids_with_labels <- get_identifiers_with_labels("individual.local.identifier")
+
+
+# Function to check for cross-dataset duplicates
+check_cross_dataset_duplicates <- function(ids) {
+  # Aggregate by identifier, listing datasets each identifier appears in
+  aggregated_ids <- aggregate(dataset ~ ., data = ids, FUN = function(x) paste(unique(x), collapse = ", "))
+  # Find identifiers that appear in more than one dataset
+  cross_dataset_duplicates <- aggregated_ids[grep(",", aggregated_ids$dataset), ]
+  return(nrow(cross_dataset_duplicates) > 0)
+}
+
+# Run checks
+has_cross_dataset_duplicated_event.id <- check_cross_dataset_duplicates(all_event_ids_with_labels)
+has_cross_dataset_duplicated_individual.local.identifier <- check_cross_dataset_duplicates(all_individual_ids_with_labels)
+
+# Print results
+cat("Are there event.id duplicated across different datasets? ", has_cross_dataset_duplicated_event.id, "\n")
+cat("Are there individual.local.identifier duplicated across different datasets? ", has_cross_dataset_duplicated_individual.local.identifier, "\n")
+
+
+### event.id AND individual.local.identifier ARE UNIQUE
+```
+
+#NEXT STEP IS combining all datasets in one
+```{r}
+# Retrieve all the dataframes
+dataframe_names <- ls(pattern = "^stork_data_")
+dataframes <- mget(dataframe_names)
+
+# Combine all dataframes into one
+combined_stork_data <- do.call(rbind, dataframes)
+
+# Optionally, add row names or reset them to ensure uniqueness
+rownames(combined_stork_data) <- NULL
+
+# Check the structure of the combined dataframe
+str(combined_stork_data)
+
+# Save the combined dataset to a CSV file for further use
+#write.csv(combined_stork_data, "D:/Vladimir/combined_stork_data.csv", row.names = FALSE)
+
+# Check for duplicate in event.id within combined_stork_data
+any(duplicated(combined_stork_data$event.id)) 
+
+# çlean environment from dataset which start with stork_data
+# List all objects that start with 'stork_data_'
+dataframes_to_remove <- ls(pattern = "^stork_data_")
+
+# Remove the listed data frames from the environment
+rm(list=dataframes_to_remove)
+rm(dataframes)
+rm(temp_data)
+
+```
+
+# START HERE
+### Based from other analysis we only want to keep dates from 2020 ("2019-12-01 00:12:00", tz = "UTC") onward so we filter that out
+### Filter 'combined_stork_data' to only keep data post 2020
+```{r}
+# to load the result of what is done below
+load("D:/Vladimir/Vladimir/FF_STK_dataset_fusion_ONLY_combined_stork_Data_post_2020_environment.RData")
+
+# not necessary if you've loaded what's above:
+# to load the df which is process by the code below
+#load("D:/Vladimir/FF_STK_dataset_fusion_ONLY_combined_stork_Data_environment.RData")
+
+# Convert the timestamp to POSIXct
+combined_stork_data$timestamp <- as.POSIXct(combined_stork_data$timestamp, format="%Y-%m-%d %H:%M:%S", tz="UTC")
+
+# Filter the data to keep only records from "2019-12-01 00:12:00" UTC onwards
+combined_stork_data <- combined_stork_data[combined_stork_data$timestamp >= as.POSIXct("2019-12-01 00:12:00", tz="UTC"), ]
+
+
+### Filter combined_stk_data to not have NA in latitudes and longitudes and transform coordinates in sf
+# Modify the combined stork tracking data for spatial analysis
+combined_stork_data <- combined_stork_data %>%
+
+  # Ensure timestamp is in POSIXct format (if not already)
+  #mutate(timestamp = as.POSIXct(timestamp, format="%Y-%m-%d %H:%M:%S", tz='UTC')) %>%
+ 
+  # Remove rows where location.long or location.lat is NA
+  filter(!is.na(location.long) & !is.na(location.lat)) %>%
+  
+  # Convert the stork tracking data to an 'sf' object to enable spatial analysis
+  # Using WGS 84 (EPSG:4326) coordinate reference system
+  st_as_sf(coords = c("location.long", "location.lat"), crs = 4326, agr = "constant", remove = FALSE)
+
+# Save the combined dataset to a CSV file for further use
+write.csv(combined_stork_data, "D:/Vladimir/combined_stork_data.csv", row.names = FALSE)
+
+
+```
+
+# ##### Dataclearing 2.0
+# We reduce the temporal resolution of 'combined_stork_data' to one entry per hour (first observed) in 'df_stork_hourly' to reduce processing time
+```{r}
+# Create a new dataframe with hourly data
+df_stork_hourly <- combined_stork_data %>%
+  group_by(individual.local.identifier) %>%  # Group data by each bird
+  mutate(hour = floor_date(timestamp, "hour")) %>%  # Create a floor date at the hourly level
+  arrange(individual.local.identifier, timestamp) %>%  # Sort by bird and timestamp
+  filter(!duplicated(hour)) %>%  # Keep only the first observation per hour per bird
+  ungroup() %>%  # Remove the grouping
+  select(-hour)  # Optionally drop the 'hour' column if no longer needed
+
+# View the structure of the new dataset
+glimpse(df_stork_hourly)
+
+#we need to make sure that df_stork_hourly is an sf object
+st_crs(df_stork_hourly)
+
+#output should be similar to:
+#Coordinate Reference System:
+  #User input: EPSG:4326 
+# etc...
+
+#to save environment
+#save.image("D:/Vladimir/FF_STK_dataset_fusion_ONLY_combined_stork_Data_post_2020_environment.RData")
+
+
+```
+
+# Bird data ready 
+# all in: 'df_stork_hourly'
+
+
+## START OF DATACLEARING FOR FOREST FIRE
+## Analysis begins in 2020 based on consistent data availability from the VIIRS S-NPP 375m dataset (coverage: 2019-12-01 to 2023-12-31 in CSV format). Prior forest fire data from before 2020 has been excluded, starting analysis post "2019-12-01 00:12:00 UTC".
+
+## FOREST FIRE download at: https://firms.modaps.eosdis.nasa.gov/download/
+## Area of Interest: -19.3,-18.4,69.6,70.7
+## Date Range: 2019-12-01 to 2023-12-31
+## Data Format: .csv
+## Data source: suomi-viirs-c2 (VIIRS S-NPP 375m)
+
+### There's 2 .csv uploaded because some data is more rescent than other so we have to bind them together
+```{r}
+# can upload what is done below by doing
+load("D:/Vladimir/Vladimir/All_in_one_codes/FF_STK_rdy_for_overlap_analysis.RData")
+
+
+# Define the paths to the CSV files
+archive_file_path <- "D:/Vladimir/FF_custom_region_data/2020 onward/DL_FIRE_SV-C2_2020-2024/fire_archive_SV-C2_461780.csv"
+nrt_file_path <- "D:/Vladimir/FF_custom_region_data/2020 onward/DL_FIRE_SV-C2_2020-2024/fire_nrt_SV-C2_461780.csv"
+
+# Define a function to read, transform, and return an sf data frame
+preprocess_and_convert_to_sf <- function(file_path) {
+  read.csv(file_path, colClasses = c("acq_time" = "character")) %>%
+    select(latitude, longitude, brightness, acq_date, acq_time, confidence) %>%
+    mutate(acq_datetime = as.POSIXct(paste(acq_date, acq_time), format = "%Y-%m-%d %H%M", tz = 'UTC')) %>%
+    st_as_sf(coords = c("longitude", "latitude"), crs = 4326, agr = "constant", remove = FALSE)
+}
+
+# Process the first file and assign to 'df_ff'
+df_ff <- preprocess_and_convert_to_sf("D:/Vladimir/FF_custom_region_data/2020 onward/DL_FIRE_SV-C2_2020-2024/fire_archive_SV-C2_461780.csv")
+
+# Read and process the second file, then combine with 'df_ff', and remove the temporary variable
+df_ff <- bind_rows(df_ff, preprocess_and_convert_to_sf("D:/Vladimir/FF_custom_region_data/2020 onward/DL_FIRE_SV-C2_2020-2024/fire_nrt_SV-C2_461780.csv"))
+
+# Now 'df_ff' contains the combined data from both files
+
+# View the structure of the newly created 'sf' object
+str(df_ff)
+
+# Save environment with both cleared datasets
+#save.image("D:/Vladimir/All_in_one_codes/FF_STK_rdy_for_overlap_analysis.RData")
+
+
+
+```
+
+
+#2. Overlap analysis ################################
+## Start of overlap analysis
+
+##Prepare Spatial Coordinates and Time Data
+```{r}
+#need 'df_stork_hourly' and 'df_ff' in the environment first
+
+# Transform df_stork_hourly to stk_coords_time, directly creating a regular data frame
+stk_coords_time <- df_stork_hourly %>%
+  select(lon = location.long, lat = location.lat, time = timestamp) %>%
+  as.data.frame()
+
+# Transform df_ff to ff_coords_time, directly creating a regular data frame
+ff_coords_time <- df_ff %>%
+  select(lon = longitude, lat = latitude, time = acq_datetime) %>%
+  as.data.frame()
+
+```
+
+##Define Spatial-Temporal Matching Function for a timeframe of 12h before and after fire event
+```{r}
+get_extended_overlap_neighbors <- function(x, stk_coords_time, ff_coords_time, radius, daysdiff) {
+  Index <- seq_len(nrow(ff_coords_time))
+
+  # Calculate time difference in seconds
+  time_diff_sec <- as.numeric(difftime(ff_coords_time$time, stk_coords_time$time[x], units = "secs"))
+  #time_diff_sec <- as.numeric(difftime(ff_coords_time[,3], stk_coords_time[x,3], units = "secs"))
+  
+  # Updated Temporal proximity check for -0.5 days before to 0.5 days after 
+  #Temporal <- (time_diff_sec >= -0.5 * 86400) & (time_diff_sec <= 0.5 * 86400) ### THIS might be wrong and we should be using:
+  Temporal <- (time_diff_sec >= -daysdiff * 86400) & (time_diff_sec <= daysdiff * 86400)
+
+  # Spatial proximity check using Haversine formula
+  Spatial <- spatialrisk:::haversine_loop_cpp(ff_coords_time[,c(1,2)], lat_center=stk_coords_time[x,2], lon_center=stk_coords_time[x,1], radius=radius)
+  
+  if (nrow(Spatial) == 0 || length(Temporal) == 0) {
+    Res <- NA
+  } else {
+    Out <- Index[(Index %in% Spatial$id) & Temporal]
+    Res <- if (length(Out) == 0) {
+      NA
+    } else {
+      if (length(Out) == 1) {
+        Out
+      } else {
+        Spatial$id[Spatial$id %in% Out][which.min(Spatial$distance_m[Spatial$id %in% Out])]
+      }
+    }
+  }
+  return(Res)
+}
+
+
+```
+
+# running the spatial-temporal neighbors search, extracting neighbor data, and then analyzing and saving the results
+
+```{r}
+#To be able to run the code on mutiple session of Rstudio, I have to first save the necessary environment (df_stork_hourly and df_ff) to run it on the other session
+#then I will only run "# code for a single bird" with the bird I want. I have to be careful to not overload the environment
+#I'll also save the whole environment in: "D:\Vladimir\Vladimir\All_in_one_codes\Full_environment_All_in_one_single_bird_overlapanalysis.Rdata" as a save switch
+# then we delete except the bare minimum we need for running "# code for a single bird"
+
+# List of essential data frames, required packages, and variables/functions
+essential_objects <- c("df_stork_hourly", "stk_coords_time", "ff_coords_time", "get_extended_overlap_neighbors", "packages")
+
+# List all objects in the environment
+all_objects <- ls()
+
+# Remove objects that are not essential
+objects_to_remove <- setdiff(all_objects, essential_objects)
+rm(list = objects_to_remove)
+
+# Save the data frames, transformed data frames, and the function to a single .RData file
+#save(df_stork_hourly, df_ff, stk_coords_time, ff_coords_time, get_extended_overlap_neighbors, file = "D:/Vladimir/Vladimir/All_in_one_codes/Cleaned_environment.RData")
+
+# To load the environment if needed
+#load("D:/Vladimir/Vladimir/All_in_one_codes/Cleaned_environment.RData")
+
+
+
+```
+
+## We need a list of birds to analyse
+```{r}
+# Extract unique bird identifiers
+unique_birds <- unique(df_stork_hourly$individual.local.identifier)
+
+# Count occurrences of each bird identifier
+bird_counts <- table(df_stork_hourly$individual.local.identifier)
+
+# Print the counts
+print(bird_counts)
+
+
+#we have to choose a bird from the 'unique_birds' list
+#head(unique_birds)
+
+#already done:
+# "Adebar / DER AX142 (eobs 4360)" 
+# "Alain (CK16337 FRUI, 180819)" 
+# "Albert + A6V24 (eobs 3813)"
+# "Alwin (E0341, e-obs 8636)"
+# "Angela / DER AY470 (eobs 4001)"
+# "Annika + / DER A8L98 (e-obs 3813)" --> only has 2 instances
+# "Anton (eobs 3561)"
+# "Bembo Sparky / DER AU891 (eobs 3042)"
+# "Bodom (eobs 3608)"
+# "Rosalie / DER A2M38 (e-obs 6993)"
+# "Mogli / DER AW534 (e-obs 6386)"
+# "Olli / DER A1P74 (e-obs 6382)"
+# "Ruby / DER A1P75 (e-obs 6383)"
+# "Blacky + / DER A1Y32 (e-obs 6380)"
+
+
+# 130 unique birds
+```
+
+
+# loop which does the whole analysis for each unique 'indivudual.local.identifier' (bird)
+```{r}
+# Extract unique bird identifiers
+unique_birds <- unique(df_stork_hourly$individual.local.identifier)
+
+# Create a directory for output if it doesn't already exist
+output_dir <- "D:/Vladimir/csv_output_All_in_one"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+# Process data bird by bird
+for (bird in unique_birds) {
+  # Subset data for the current bird
+  current_stork_data <- df_stork_hourly[df_stork_hourly$individual.local.identifier == bird, ]
+  current_stork_coords_time <- current_stork_data %>%
+    select(lon = location.long, lat = location.lat, time = timestamp) %>%
+    as.data_frame()
+  
+  # Find neighbors
+  neighbors_100km <- sapply(seq_len(nrow(current_stork_coords_time)), 
+                             FUN=function(x) get_extended_overlap_neighbors(x, current_stork_coords_time, ff_coords_time, 100000, 0.5))
+
+  # Extract neighbor data
+  neighbors_100km_data <- current_stork_data[!is.na(neighbors_100km),]
+  neighbors_100km_data$Dist2Fire <- st_distance(current_stork_data[!is.na(neighbors_100km),], df_ff[neighbors_100km[!is.na(neighbors_100km)],], by_element = TRUE)
+
+  # Ensure df_ff has an identifiable, non-spatial ID column
+  df_ff <- df_ff %>% 
+    mutate(fire_id = row_number()) 
+
+  df_ff_for_join <- df_ff %>% 
+    st_drop_geometry() %>%
+    select(fire_id, fire_longitude = longitude, fire_latitude = latitude, fire_time = acq_datetime, fire_confidence = confidence)
+
+  # Create the final dataset with all required information
+  Final_tracks_extended <- neighbors_100km_data %>%
+    mutate(Nearest_fire_ID = neighbors_100km[!is.na(neighbors_100km)]) %>%
+    left_join(df_ff_for_join, by = c("Nearest_fire_ID" = "fire_id")) %>%
+    mutate(TimeDiff2Fire = difftime(timestamp, df_ff_for_join$fire_time[Nearest_fire_ID]))
+  
+  #dropping the spatial data to wirte csv
+  non_spatial_data <- st_drop_geometry(Final_tracks_extended)
+  
+  # Save the final tracks data to a file named after the bird
+  file_name <- paste0(output_dir, "/Hourly_overlap_", gsub("[^A-Za-z0-9_\\.]", "_", bird), ".csv")
+  write.csv(non_spatial_data, file_name, row.names = FALSE)
+
+}
+
+```
+
+# Function to easily upload any csv
+```{r}
+# Function to load and transform CSV data
+load_and_transform_data <- function(file_path) {
+  # Read the CSV file
+  data <- read.csv(file_path, stringsAsFactors = FALSE)
+  
+  # Convert date-time fields
+  data$timestamp <- as.POSIXct(data$timestamp, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
+  data$fire_time <- as.POSIXct(data$fire_time, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
+  
+  # Convert Dist2Fire to numeric (assuming data is in meters)
+  data$Dist2Fire <- as.numeric(data$Dist2Fire)
+  
+  # Convert TimeDiff2Fire to difftime in seconds
+  data$TimeDiff2Fire <- as.difftime(data$TimeDiff2Fire, units = "secs")
+  
+  # Return the transformed data
+  return(data)
+}
+
+#csv upload 
+Adebar_hourly_data <- load_and_transform_data("D:\\Vladimir\\csv_output_All_in_one\\Hourly_overlap_Adebar___DER_AX142__eobs_4360_.csv")
+Alain_hourly_data <- load_and_transform_data("D:\\Vladimir\\csv_output_All_in_one\\Hourly_overlap_Alain__CK16337_FRUI__180819_.csv")
+
+
+```
+
+# modify csv to add new logical statement columns: "overlap within 10km range" and "fire occuring within the last hour" and a numerical "Distance to fire within the last hour"
+```{r}
+# Assuming Alain_hourly_data is already loaded and transformed
+
+# 1. Add a column to check if Dist2Fire is within 10km (10000 meters)
+Alain_hourly_data$Within_10km <- Alain_hourly_data$Dist2Fire <= 10000
+
+# 2. Add a column to check if a fire occurred within hour before and after the overlap (3600 seconds before and after)
+Alain_hourly_data$Fire_within_last_hour <- abs(as.numeric(Alain_hourly_data$TimeDiff2Fire, units = "secs")) <= 3600
+
+# Add a column to check if a fire occurred within the last hour and return the distance
+Alain_hourly_data$Dist_to_fire_within_last_hour <- ifelse(
+  abs(as.numeric(Alain_hourly_data$TimeDiff2Fire, units = "secs")) <= 3600, 
+  Alain_hourly_data$Dist2Fire, 
+  NA
+)
+
+
+# Check if there are any TRUE statements in the new columns
+any_within_10km <- any(Alain_hourly_data$Within_10km)
+any_fire_within_last_hour <- any(Alain_hourly_data$Fire_within_last_hour)
+any_dist_to_fire_within_last_hour <- any(!is.na(Alain_hourly_data$Dist_to_fire_within_last_hour))
+
+
+# Count the number of TRUE statements in the new columns
+count_within_10km <- sum(Alain_hourly_data$Within_10km, na.rm = TRUE)
+count_fire_within_last_hour <- sum(Alain_hourly_data$Fire_within_last_hour, na.rm = TRUE)
+count_dist_to_fire_within_last_hour <- sum(!is.na(Alain_hourly_data$Dist_to_fire_within_last_hour))
+
+
+# Print the results
+cat("Are there any TRUE statements for Within_10km? ", any_within_10km, "\n")
+cat("Number of TRUE statements for Within_10km: ", count_within_10km, "\n")
+cat("Are there any TRUE statements for Fire_within_last_hour? ", any_fire_within_last_hour, "\n")
+cat("Number of TRUE statements for Fire_within_last_hour: ", count_fire_within_last_hour, "\n")
+cat("Are there any TRUE statements for Dist_to_fire_within_last_hour? ", any_dist_to_fire_within_last_hour, "\n")
+cat("Number of TRUE statements for Dist_to_fire_within_last_hour: ", count_dist_to_fire_within_last_hour, "\n")
+
+
+
+
+```
+#AA single code bird with added columns, processing takes roughtly 2-3 seconds per bird_count$Freq (number of row with the bird in question) THIS IS WORKING!
+```{r}
+# Create a directory for output if it doesn't already exist
+output_dir <- "D:/Vladimir/csv_output_All_in_one_plus"
+if (!dir.exists(output_dir)) {dir.create(output_dir)}
+
+start_time <- proc.time()
+
+#output_dir <- "D:/Vladimir/csv_output_All_in_one"
+
+# Specify the bird you want to process
+bird <- "Ruby / DER A1P75 (e-obs 6383)"
+
+# Subset data for the specified bird and convert to a data frame
+current_stork_data <- df_stork_hourly[df_stork_hourly$`individual.local.identifier` == bird, ]
+current_stork_coords_time <- current_stork_data %>%
+  select(lon = location.long, lat = location.lat, time = timestamp) %>%
+  data.frame()  # Convert to traditional data frame
+
+
+# Find neighbors 
+# This is the spacial analysis and very long to run
+neighbors_100km <- sapply(seq_len(nrow(current_stork_coords_time)), 
+                           FUN=function(x) get_extended_overlap_neighbors(x, current_stork_coords_time, ff_coords_time, 100000, 0.5))
+
+#load df_ff for analysis below
+load("D:/Vladimir/Vladimir/All_in_one_codes/df_ff.RData")
+
+# Extract neighbor data
+neighbors_100km_data <- current_stork_data[!is.na(neighbors_100km),]
+#neighbors_100km_data$Dist2Fire <- st_distance(current_stork_data[!is.na(neighbors_100km),], df_ff[neighbors_100km[!is.na(neighbors_100km)],], by_element = TRUE) #dist2fire is in meters
+#this one below is a test to streamline the process
+neighbors_100km_data$Dist2Fire <- as.numeric(st_distance(current_stork_data[!is.na(neighbors_100km),], df_ff[neighbors_100km[!is.na(neighbors_100km)],], by_element = TRUE)) #dist2fire is in meters
+
+# Ensure df_ff has an identifiable, non-spatial ID column
+df_ff <- df_ff %>% 
+  mutate(fire_id = row_number()) 
+
+df_ff_for_join <- df_ff %>% 
+  st_drop_geometry() %>%
+  select(fire_id, fire_longitude = longitude, fire_latitude = latitude, fire_time = acq_datetime, fire_confidence = confidence)
+
+#remove df_ff for the next run
+rm(df_ff)
+
+# Create the final dataset with all required information
+Final_tracks_extended <- neighbors_100km_data %>%
+  mutate(Nearest_fire_ID = neighbors_100km[!is.na(neighbors_100km)]) %>%
+  left_join(df_ff_for_join, by = c("Nearest_fire_ID" = "fire_id")) %>%
+  mutate(TimeDiff2Fire = difftime(timestamp, df_ff_for_join$fire_time[Nearest_fire_ID])) %>%
+  mutate(
+    Within_10km = Dist2Fire <= 10000,  # Add a column to check if Dist2Fire is within 10km (10000 meters)
+    Fire_within_last_hour = abs(as.numeric(TimeDiff2Fire, units = "secs")) <= 3600,  # Add a column to check if a fire occurred within hour before and after the overlap
+    Dist_to_fire_within_last_hour = ifelse(abs(as.numeric(TimeDiff2Fire, units = "secs")) <= 3600, Dist2Fire, NA)  # Add a column to check if a fire occurred within the last hour and return the distance
+  )
+
+  #dropping the spatial data to wirte csv
+non_spatial_data <- st_drop_geometry(Final_tracks_extended)
+
+file_name <- paste0(output_dir, "/Hourly_overlap_", gsub("[^A-Za-z0-9_\\.]", "_", bird), ".csv")
+write.csv(non_spatial_data, file_name, row.names = FALSE)
+
+end_time <- proc.time()
+elapsed_time <- end_time - start_time
+print(elapsed_time)
+
+
+```
+
+#AA load the new csv THIS IS WORKING
+```{r}
+# Function to load and transform CSV data
+load_and_transform_data <- function(file_path) {
+  # Read the CSV file
+  data <- read.csv(file_path, stringsAsFactors = FALSE)
+  
+  # Convert date-time fields
+  data$timestamp <- as.POSIXct(data$timestamp, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
+  data$fire_time <- as.POSIXct(data$fire_time, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
+  
+  # Convert Dist2Fire to numeric (assuming data is in meters)
+  data$Dist2Fire <- as.numeric(data$Dist2Fire)
+  
+  # Convert TimeDiff2Fire to difftime in seconds
+  data$TimeDiff2Fire <- as.difftime(data$TimeDiff2Fire, units = "secs")
+  
+  # Convert Within_10km and Fire_within_last_hour to logical
+  data$Within_10km <- as.logical(data$Within_10km)
+  data$Fire_within_last_hour <- as.logical(data$Fire_within_last_hour)
+  
+  # Convert Dist_to_fire_within_last_hour to numeric
+  data$Dist_to_fire_within_last_hour <- as.numeric(data$Dist_to_fire_within_last_hour)
+  
+  # Return the transformed data
+  return(data)
+}
+
+# Load the updated CSV data
+updated_file_path <- "D:\\Vladimir\\csv_output_All_in_one_plus\\Hourly_overlap_Bembo_Sparky___DER_AU891__eobs_3042_.csv"
+Bembo_hourly_data <- load_and_transform_data(updated_file_path)
+
+# Inspect the structure of the modified dataframe
+str(Adebar_hourly_data)
+
+
+
+```
+
+
+# To read all the csv we create a loop, to go faster we want to run 2 sessions at the same time, we want both session to process a similar amount of data, to do so we make a list of the birds we have (total amount minus what was already processed), order them my heaviest data (highest Freq) and tell the scripts the process every 2 lines, on scipt beggins line 1 and the other line 2.
+
+
+```{r}
+#To be able to run the code on mutiple session of Rstudio, I have to first save the necessary environment (df_stork_hourly and df_ff) to run it on the other session
+#then I will only run "# code for a single bird" with the bird I want. I have to be careful to not overload the environment
+#I'll also save the whole environment in: "D:\Vladimir\Vladimir\All_in_one_codes\Full_environment_All_in_one_single_bird_overlapanalysis.Rdata" as a save switch
+# then we delete except the bare minimum we need for running "# code for a single bird"
+
+# Clean up the environment to save RAM
+essential_objects <- c("df_stork_hourly", "ff_coords_time", "stk_coords_time", "get_extended_overlap_neighbors", "packages", "birds_session_1", "birds_session_2")
+all_objects <- ls()
+objects_to_remove <- setdiff(all_objects, essential_objects)
+rm(list = objects_to_remove)
+gc()
+# Save the data frames, transformed data frames, and the function to a single .RData file
+#save.image(file = "D:/Vladimir/Vladimir/All_in_one_codes/Cleaned_environment_for_loop.RData")
+
+# To load the environment if needed
+#load("D:/Vladimir/Vladimir/All_in_one_codes/Cleaned_environment_for_loop.RData")
+
+
+
+```
+
+## define the list of birds to process and sort by frequency, then split the list into two parts
+## not needed if previous code has been processed
+```{r}
+# Define the list of already processed birds
+processed_birds <- c(
+  "Adebar / DER AX142 (eobs 4360)", 
+  "Alain (CK16337 FRUI, 180819)", 
+  "Albert + A6V24 (eobs 3813)",
+  "Alwin (E0341, e-obs 8636)",
+  "Angela / DER AY470 (eobs 4001)",
+  "Annika + / DER A8L98 (e-obs 3813)",
+  "Anton (eobs 3561)",
+  "Bembo Sparky / DER AU891 (eobs 3042)",
+  "Bodom (eobs 3608)",
+  "Rosalie / DER A2M38 (e-obs 6993)",
+  "Mogli / DER AW534 (e-obs 6386)",
+  "Olli / DER A1P74 (e-obs 6382)",
+  "Ruby / DER A1P75 (e-obs 6383)",
+  "Blacky + / DER A1Y32 (e-obs 6380)"
+)
+
+# Extract unique bird identifiers and their counts
+bird_counts <- table(df_stork_hourly$individual.local.identifier)
+
+# Convert to a data frame and filter out already processed birds
+bird_counts_df <- as.data.frame(bird_counts) %>%
+  filter(!Var1 %in% processed_birds) %>%
+  arrange(Freq)  # Sort by frequency
+
+# Split the birds into two lists for the two R sessions
+birds_session_1 <- bird_counts_df$Var1[seq(1, nrow(bird_counts_df), by = 2)]
+birds_session_2 <- bird_counts_df$Var1[seq(2, nrow(bird_counts_df), by = 2)]
+
+```
+
+
+#Session 1: Process every other bird starting from the first
+```{r}
+# Specify the output directory
+output_dir <- "D:/Vladimir/csv_output_All_in_one_plus_session_2"
+if (!dir.exists(output_dir)) {dir.create(output_dir)}
+
+# Function to process each bird
+process_bird <- function(bird) {
+  start_time <- proc.time()
+  
+  # Subset data for the specified bird and convert to a data frame
+  current_stork_data <- df_stork_hourly[df_stork_hourly$`individual.local.identifier` == bird, ]
+  current_stork_coords_time <- current_stork_data %>%
+    select(lon = location.long, lat = location.lat, time = timestamp) %>%
+    data.frame()  # Convert to traditional data frame
+
+  # Find neighbors (spatial analysis)
+  neighbors_100km <- sapply(seq_len(nrow(current_stork_coords_time)), 
+                            FUN=function(x) get_extended_overlap_neighbors(x, current_stork_coords_time, ff_coords_time, 100000, 0.5))
+  
+  # Load df_ff for analysis below (assuming df_ff is already loaded in the environment)
+  load("D:/Vladimir/Vladimir/All_in_one_codes/df_ff.RData")
+  
+  # Extract neighbor data
+  neighbors_100km_data <- current_stork_data[!is.na(neighbors_100km),]
+  neighbors_100km_data$Dist2Fire <- as.numeric(st_distance(current_stork_data[!is.na(neighbors_100km),], df_ff[neighbors_100km[!is.na(neighbors_100km)],], by_element = TRUE)) # dist2fire is in meters
+
+  # Ensure df_ff has an identifiable, non-spatial ID column
+  df_ff <- df_ff %>% 
+    mutate(fire_id = row_number()) 
+
+  df_ff_for_join <- df_ff %>% 
+    st_drop_geometry() %>%
+    select(fire_id, fire_longitude = longitude, fire_latitude = latitude, fire_time = acq_datetime, fire_confidence = confidence)
+
+  # Remove df_ff for the next run
+  rm(df_ff)
+
+  # Create the final dataset with all required information
+  Final_tracks_extended <- neighbors_100km_data %>%
+    mutate(Nearest_fire_ID = neighbors_100km[!is.na(neighbors_100km)]) %>%
+    left_join(df_ff_for_join, by = c("Nearest_fire_ID" = "fire_id")) %>%
+    mutate(TimeDiff2Fire = difftime(timestamp, df_ff_for_join$fire_time[Nearest_fire_ID])) %>%
+    mutate(
+      Within_10km = Dist2Fire <= 10000,  # Add a column to check if Dist2Fire is within 10km (10000 meters)
+      Fire_within_last_hour = abs(as.numeric(TimeDiff2Fire, units = "secs")) <= 3600,  # Add a column to check if a fire occurred within hour before and after the overlap
+      Dist_to_fire_within_last_hour = ifelse(abs(as.numeric(TimeDiff2Fire, units = "secs")) <= 3600, Dist2Fire, NA)  # Add a column to check if a fire occurred within the last hour and return the distance
+    )
+
+  # Drop the spatial data to write csv
+  non_spatial_data <- st_drop_geometry(Final_tracks_extended)
+
+  file_name <- paste0(output_dir, "/Hourly_overlap_", gsub("[^A-Za-z0-9_\\.]", "_", bird), ".csv")
+  write.csv(non_spatial_data, file_name, row.names = FALSE)
+
+  end_time <- proc.time()
+  elapsed_time <- end_time - start_time
+  print(elapsed_time)
+  
+  # Clean up the environment to save RAM
+  essential_objects <- c("df_stork_hourly", "ff_coords_time", "stk_coords_time", "get_extended_overlap_neighbors", "packages", "birds_session_1", "birds_session_2")
+  all_objects <- ls()
+  objects_to_remove <- setdiff(all_objects, essential_objects)
+  rm(list = objects_to_remove)
+}
+
+# Process each bird in session 1
+for (bird in birds_session_1) {
+  process_bird(bird)
+}
+
+
+```
+
+# somehow, "Annika + / DER A8L98 (e-obs 3813)" is in neither lists but there's only 2 entries of this bird so let's not count it to simplify the process.
+#for session 2 make sure: 
+```{r}
+#load("D:/Vladimir/Vladimir/All_in_one_codes/Cleaned_environment.RData")
+
+#then
+
+# List of essential data frames, required packages, and variables/functions
+essential_objects <- c("df_stork_hourly", "stk_coords_time", "ff_coords_time", "get_extended_overlap_neighbors", "packages")
+
+# List all objects in the environment
+all_objects <- ls()
+
+# Remove objects that are not essential
+objects_to_remove <- setdiff(all_objects, essential_objects)
+rm(list = objects_to_remove)
+
+# then
+
+# Define the list of already processed birds
+processed_birds <- c(
+  "Adebar / DER AX142 (eobs 4360)", 
+  "Alain (CK16337 FRUI, 180819)", 
+  "Albert + A6V24 (eobs 3813)",
+  "Alwin (E0341, e-obs 8636)",
+  "Angela / DER AY470 (eobs 4001)",
+  "Annika + / DER A8L98 (e-obs 3813)",
+  "Anton (eobs 3561)",
+  "Bembo Sparky / DER AU891 (eobs 3042)",
+  "Bodom (eobs 3608)",
+  "Rosalie / DER A2M38 (e-obs 6993)",
+  "Mogli / DER AW534 (e-obs 6386)",
+  "Olli / DER A1P74 (e-obs 6382)",
+  "Ruby / DER A1P75 (e-obs 6383)",
+  "Blacky + / DER A1Y32 (e-obs 6380)"
+)
+
+# Extract unique bird identifiers and their counts
+bird_counts <- table(df_stork_hourly$individual.local.identifier)
+
+# Convert to a data frame and filter out already processed birds
+bird_counts_df <- as.data.frame(bird_counts) %>%
+  filter(!Var1 %in% processed_birds) %>%
+  arrange(Freq)  # Sort by frequency
+
+# Split the birds into two lists for the two R sessions
+birds_session_1 <- bird_counts_df$Var1[seq(1, nrow(bird_counts_df), by = 2)]
+birds_session_2 <- bird_counts_df$Var1[seq(2, nrow(bird_counts_df), by = 2)]
+
+```
+
+#Now we can run session 2
+```{r}
+# Process each bird in session 2
+for (bird in birds_session_2) {
+  process_bird(bird)
+}
+
+```
+
+#session 1 was stopped, to find where we are in the process we will take the original session 1 what is in the list by what is in "D:/Vladimir/csv_output_All_in_one_plus" (output of session 1)
+```{r}
+
+
+```
+
+
+#NOT USFULL ANYMORE - load and modify files from D:\Vladimir\csv_output_All_in_one modify them to add new columns: within_10km, Fire_within_last_hour and Dist_to_fire_within_last_hour
+```{r}
+# Load necessary library
+library(dplyr)
+
+# Specify the input file path and output directory
+input_file_path <- "D:\\Vladimir\\csv_output_All_in_one\\Hourly_overlap_Adebar___DER_AX142__eobs_4360_.csv"
+output_dir <- "D:\\Vladimir\\csv_output_All_in_one_plus"
+
+# Function to load, transform, and update CSV data
+load_transform_and_update_data <- function(file_path, output_dir) {
+  # Read the CSV file
+  data <- read.csv(file_path, stringsAsFactors = FALSE)
+  
+  # Convert date-time fields
+  data$timestamp <- as.POSIXct(data$timestamp, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
+  data$fire_time <- as.POSIXct(data$fire_time, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
+  
+  # Convert Dist2Fire to numeric (assuming data is in meters)
+  data$Dist2Fire <- as.numeric(data$Dist2Fire)
+  
+  # Convert TimeDiff2Fire to difftime in seconds
+  data$TimeDiff2Fire <- as.difftime(data$TimeDiff2Fire, units = "secs")
+  
+  # Calculate the missing values
+  data <- data %>%
+    mutate(
+      Within_10km = Dist2Fire <= 10000,  # Add a column to check if Dist2Fire is within 10km (10000 meters)
+      Fire_within_last_hour = abs(as.numeric(TimeDiff2Fire, units = "secs")) <= 3600,  # Add a column to check if a fire occurred within hour before and after the overlap
+      Dist_to_fire_within_last_hour = ifelse(abs(as.numeric(TimeDiff2Fire, units = "secs")) <= 3600, Dist2Fire, NA)  # Add a column to check if a fire occurred within the last hour and return the distance
+    )
+  
+  # Generate output file name
+  file_name <- basename(file_path)
+  output_file_path <- file.path(output_dir, file_name)
+  
+  # Save the updated data to a new CSV file
+  write.csv(data, output_file_path, row.names = FALSE)
+  
+  return(output_file_path)
+}
+
+# Process the CSV file
+updated_file_path <- load_transform_and_update_data(input_file_path, output_dir)
+
+cat("Updated file saved to:", updated_file_path, "\n")
+
+
+
+```
+# NOT USFULL ANYMORE - Loop to process all the files in the folder
+```{r}
+# Load necessary library
+library(dplyr)
+
+# Function to load, transform, and update CSV data
+load_transform_and_update_data <- function(file_path, output_dir) {
+  # Read the CSV file
+  data <- read.csv(file_path, stringsAsFactors = FALSE)
+  
+  # Convert date-time fields
+  data$timestamp <- as.POSIXct(data$timestamp, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
+  data$fire_time <- as.POSIXct(data$fire_time, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
+  
+  # Convert Dist2Fire to numeric (assuming data is in meters)
+  data$Dist2Fire <- as.numeric(data$Dist2Fire)
+  
+  # Convert TimeDiff2Fire to difftime in seconds
+  data$TimeDiff2Fire <- as.difftime(data$TimeDiff2Fire, units = "secs")
+  
+  # Calculate the missing values
+  data <- data %>%
+    mutate(
+      Within_10km = Dist2Fire <= 10000,  # Add a column to check if Dist2Fire is within 10km (10000 meters)
+      Fire_within_last_hour = abs(as.numeric(TimeDiff2Fire, units = "secs")) <= 3600,  # Add a column to check if a fire occurred within hour before and after the overlap
+      Dist_to_fire_within_last_hour = ifelse(abs(as.numeric(TimeDiff2Fire, units = "secs")) <= 3600, Dist2Fire, NA)  # Add a column to check if a fire occurred within the last hour and return the distance
+    )
+  
+  # Generate output file name
+  file_name <- basename(file_path)
+  output_file_path <- file.path(output_dir, file_name)
+  
+  # Save the updated data to a new CSV file
+  write.csv(data, output_file_path, row.names = FALSE)
+  
+  return(output_file_path)
+}
+
+# Specify the input and output directories
+input_dir <- "D:\\Vladimir\\csv_output_All_in_one"
+output_dir <- "D:\\Vladimir\\csv_output_All_in_one_plus"
+
+# Get a list of all CSV files in the input directory
+csv_files <- list.files(input_dir, pattern = "\\.csv$", full.names = TRUE)
+
+# Process each CSV file
+for (file_path in csv_files) {
+  updated_file_path <- load_transform_and_update_data(file_path, output_dir)
+  cat("Updated file saved to:", updated_file_path, "\n")
+}
+
+```
+# NOT USEFULL ANYMORE - code for single bird (old) processing takes roughtly 2-3 seconds per bird_count$Freq (number of row with the bird in question)
+```{r}
+# Create a directory for output if it doesn't already exist
+#output_dir <- "D:/Vladimir/csv_output_All_in_one"
+#if (!dir.exists(output_dir)) {dir.create(output_dir)}
+
+start_time <- proc.time()
+
+output_dir <- "D:/Vladimir/csv_output_All_in_one"
+
+# Specify the bird you want to process
+bird <- "Bembo Sparky / DER AU891 (eobs 3042)"
+
+# Subset data for the specified bird and convert to a data frame
+current_stork_data <- df_stork_hourly[df_stork_hourly$`individual.local.identifier` == bird, ]
+current_stork_coords_time <- current_stork_data %>%
+  select(lon = location.long, lat = location.lat, time = timestamp) %>%
+  data.frame()  # Convert to traditional data frame
+
+
+# Find neighbors 
+# This is the spacial analysis and very long to run
+neighbors_100km <- sapply(seq_len(nrow(current_stork_coords_time)), 
+                           FUN=function(x) get_extended_overlap_neighbors(x, current_stork_coords_time, ff_coords_time, 100000, 0.5))
+
+#load df_ff for analysis below
+load("D:/Vladimir/Vladimir/All_in_one_codes/df_ff.RData")
+
+# Extract neighbor data
+neighbors_100km_data <- current_stork_data[!is.na(neighbors_100km),]
+neighbors_100km_data$Dist2Fire <- st_distance(current_stork_data[!is.na(neighbors_100km),], df_ff[neighbors_100km[!is.na(neighbors_100km)],], by_element = TRUE) #dist2fire is in meters
+
+# Ensure df_ff has an identifiable, non-spatial ID column
+df_ff <- df_ff %>% 
+  mutate(fire_id = row_number()) 
+
+df_ff_for_join <- df_ff %>% 
+  st_drop_geometry() %>%
+  select(fire_id, fire_longitude = longitude, fire_latitude = latitude, fire_time = acq_datetime, fire_confidence = confidence)
+
+#remove df_ff for the next run
+rm(df_ff)
+
+  # Create the final dataset with all required information
+Final_tracks_extended <- neighbors_100km_data %>%
+  mutate(Nearest_fire_ID = neighbors_100km[!is.na(neighbors_100km)]) %>%
+  left_join(df_ff_for_join, by = c("Nearest_fire_ID" = "fire_id")) %>%
+  mutate(TimeDiff2Fire = difftime(timestamp, df_ff_for_join$fire_time[Nearest_fire_ID]))
+  
+  #dropping the spatial data to wirte csv
+non_spatial_data <- st_drop_geometry(Final_tracks_extended)
+
+file_name <- paste0(output_dir, "/Hourly_overlap_", gsub("[^A-Za-z0-9_\\.]", "_", bird), ".csv")
+write.csv(non_spatial_data, file_name, row.names = FALSE)
+
+end_time <- proc.time()
+elapsed_time <- end_time - start_time
+print(elapsed_time)
+
+
+```
+# NOT USFULL ANYMORE - code for a single bird (old )
+```{r}
+# Create a directory for output if it doesn't already exist
+#output_dir <- "D:/Vladimir/csv_output_All_in_one"
+#if (!dir.exists(output_dir)) {dir.create(output_dir)}
+
+output_dir <- "D:/Vladimir/csv_output_All_in_one"
+
+# Specify the bird you want to process
+bird <- "Angela / DER AY470 (eobs 4001)"
+
+# Subset data for the specified bird and convert to a data frame
+current_stork_data <- df_stork_hourly[df_stork_hourly$`individual.local.identifier` == bird, ]
+current_stork_coords_time <- current_stork_data %>%
+  select(lon = location.long, lat = location.lat, time = timestamp) %>%
+  data.frame()  # Convert to traditional data frame
+
+# Find neighbors 
+# This is the spacial analysis and very long to run
+neighbors_100km <- sapply(seq_len(nrow(current_stork_coords_time)), 
+                           FUN=function(x) get_extended_overlap_neighbors(x, current_stork_coords_time, ff_coords_time, 100000, 0.5))
+
+# Extract neighbor data
+neighbors_100km_data <- current_stork_data[!is.na(neighbors_100km),]
+neighbors_100km_data$Dist2Fire <- st_distance(current_stork_data[!is.na(neighbors_100km),], df_ff[neighbors_100km[!is.na(neighbors_100km)],], by_element = TRUE)
+
+# Ensure df_ff has an identifiable, non-spatial ID column
+df_ff <- df_ff %>% 
+  mutate(fire_id = row_number()) 
+
+df_ff_for_join <- df_ff %>% 
+  st_drop_geometry() %>%
+  select(fire_id, fire_longitude = longitude, fire_latitude = latitude, fire_time = acq_datetime, fire_confidence = confidence)
+
+  # Create the final dataset with all required information
+Final_tracks_extended <- neighbors_100km_data %>%
+  mutate(Nearest_fire_ID = neighbors_100km[!is.na(neighbors_100km)]) %>%
+  left_join(df_ff_for_join, by = c("Nearest_fire_ID" = "fire_id")) %>%
+  mutate(TimeDiff2Fire = difftime(timestamp, df_ff_for_join$fire_time[Nearest_fire_ID]))
+  
+  #dropping the spatial data to wirte csv
+non_spatial_data <- st_drop_geometry(Final_tracks_extended)
+
+file_name <- paste0(output_dir, "/Hourly_overlap_", gsub("[^A-Za-z0-9_\\.]", "_", bird), ".csv")
+write.csv(non_spatial_data, file_name, row.names = FALSE)
+
+```
+
+
+
+
